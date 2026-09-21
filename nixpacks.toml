@@ -1,0 +1,9 @@
+[phases.setup]
+aptPkgs = ["ffmpeg"]
+nixPkgs = ["python311", "python311Packages.pip"]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[start]
+cmd = "python -m music_bot.main"

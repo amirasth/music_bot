@@ -1,0 +1,7 @@
+aiogram>=3.13.0,<4.0.0
+aiohttp>=3.9.0
+aiosqlite>=0.20.0
+python-dotenv>=1.0.0
+yt-dlp>=2024.8.6
+mutagen>=1.47.0
+shazamio>=0.6.0
