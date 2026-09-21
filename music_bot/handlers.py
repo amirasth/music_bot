@@ -1,5 +1,6 @@
 """Bot message and callback handlers — search, identify, download, send."""
 
+import asyncio
 import logging
 import re
 import shutil
@@ -11,7 +12,7 @@ from typing import Any
 import aiohttp
 from aiogram import Bot, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, FSInputFile, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from .config import Settings
 from .db import DB
@@ -694,8 +695,6 @@ async def process_search(m: Message, query: str, settings: Settings) -> None:
     rows.append(
         [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="home")]
     )
-
-    from aiogram.types import InlineKeyboardMarkup
 
     await status.edit_text(
         f"🔎 نتایج جستجو برای: {query}",
