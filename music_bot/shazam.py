@@ -80,23 +80,21 @@ async def prepare_segment(src: str, dst: str, start_sec: int, dur: int = 15) -> 
 
 
 async def identify_with_multi_segment(probe: str, probe_root: Path) -> dict[str, str] | None:
-    """Try Shazam on segments at 5s, 20s, 40s (15s each)."""
-    segment_starts = [5, 20, 40]
-    for start in segment_starts:
-        seg_path = probe_root / f"seg_{start}.mp3"
-        if await prepare_segment(probe, str(seg_path), start_sec=start, dur=15):
-            res = await recognize_with_shazam(str(seg_path))
-            try:
-                seg_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            if res:
-                log.info(f'[SHAZAM] Match at {start}s: {res["title"]} — {res.get("artist", "")}')
-                return res
-            else:
-                log.info(f"[SHAZAM] No match at {start}s")
+    """Try Shazam on a single segment at 5s (20s duration for better fingerprinting)."""
+    seg_path = probe_root / "seg_5.mp3"
+    if await prepare_segment(probe, str(seg_path), start_sec=5, dur=20):
+        res = await recognize_with_shazam(str(seg_path))
         try:
             seg_path.unlink(missing_ok=True)
         except Exception:
             pass
+        if res:
+            log.info(f'[SHAZAM] Match at 5s: {res["title"]} — {res.get("artist", "")}')
+            return res
+        else:
+            log.info("[SHAZAM] No match at 5s")
+    try:
+        seg_path.unlink(missing_ok=True)
+    except Exception:
+        pass
     return None

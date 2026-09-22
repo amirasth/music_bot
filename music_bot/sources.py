@@ -12,6 +12,26 @@ from .utils import fuzzy_ratio
 
 log = logging.getLogger("music_bot.sources")
 
+# Words that indicate a non-original version — penalize these in matching
+_REMIX_WORDS = re.compile(
+    r"\b(remix|edit|live|cover|acoustic|slowed|reverb|mashup|bootleg|vip|extended|radio\s*edit|dance\s*remix|club\s*mix|instrumental|karaoke|parody)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_remix(result_title: str) -> bool:
+    """Check if a result title looks like a remix/non-original."""
+    return bool(_REMIX_WORDS.search(result_title))
+
+
+def _match_score(original_title: str, result_title: str) -> float:
+    """Score a result — base fuzzy ratio penalized if it's a remix."""
+    score = fuzzy_ratio(original_title, result_title)
+    if _is_remix(result_title):
+        score *= 0.5
+        log.info(f"[MATCH] Remix penalty applied: {result_title[:40]} → {score:.2f}")
+    return score
+
 # ── Avaland (Persian music sources) ──
 try:
     from avaland.manager import SourceManager
@@ -511,7 +531,7 @@ async def find_youtube_match(
     best_score = 0.0
     for r in results:
         r_title = str(r.get("title", ""))
-        score = fuzzy_ratio(title, r_title)
+        score = _match_score(title, r_title)
         log.info(f"[YT] Candidate: {r_title[:50]} | fuzzy={score:.2f}")
         if score > best_score:
             best_score = score
@@ -617,62 +637,102 @@ async def identify_track(url: str) -> dict[str, Any] | None:
 async def find_best_match(
     title: str, artist: str, settings: Settings | None = None
 ) -> dict[str, Any] | None:
-    """Search all sources in priority order and return the best match.
+    """Search all sources in parallel and return the best match.
 
     Priority: Avaland > Audius > SoundCloud > Piped > YouTube > Archive.org
     Returns {"url", "source", "title", "artist", "duration", "download_url"} or None.
     """
     query = f"{artist} {title}".strip() if artist else title
 
-    # 1) Avaland (Persian music)
-    if settings is None or settings.enable_avaland:
+    # ── Search all sources in parallel ──
+    async def _search_avaland():
+        if settings and not settings.enable_avaland:
+            return None
         try:
-            result = await search_avaland(query)
-            if result and result.get("url"):
-                log.info(f"[MATCH] Avaland hit: {result.get('title', '')} from {result.get('source', '')}")
-                return {
-                    "url": result["url"],
-                    "download_url": result["url"],
-                    "source": result.get("source", "Avaland"),
-                    "title": result.get("title") or title,
-                    "artist": result.get("artist") or artist,
-                    "duration": result.get("duration", 0),
-                }
-        except Exception as e:
-            log.warning(f"[MATCH] Avaland error: {e}")
+            return await search_avaland(query)
+        except Exception:
+            return None
 
-    # 2) Audius (free streaming)
-    if settings is None or settings.enable_audius:
+    async def _search_audius():
+        if settings and not settings.enable_audius:
+            return []
         try:
-            audius_results = await search_audius_async(query, limit=5)
-            for r in audius_results:
-                score = fuzzy_ratio(title, r.get("title", ""))
-                if score >= 0.55:
-                    log.info(f"[MATCH] Audius hit: {r['title'][:50]} (score={score:.2f})")
-                    return {
-                        "url": r.get("stream_url", ""),
-                        "download_url": r.get("stream_url", ""),
-                        "source": "Audius",
-                        "title": r.get("title") or title,
-                        "artist": r.get("artist") or artist,
-                        "duration": r.get("duration", 0),
-                    }
-        except Exception as e:
-            log.warning(f"[MATCH] Audius error: {e}")
+            return await search_audius_async(query, limit=5)
+        except Exception:
+            return []
 
-    # 3) SoundCloud
-    try:
-        sc_results = await search_soundcloud(query, limit=5)
-    except Exception:
-        sc_results = []
-    for r in sc_results:
+    async def _search_soundcloud():
+        try:
+            return await search_soundcloud(query, limit=5)
+        except Exception:
+            return []
+
+    async def _search_piped():
+        if settings and not settings.enable_piped:
+            return []
+        try:
+            return await search_piped(query, limit=5)
+        except Exception:
+            return []
+
+    async def _search_youtube():
+        try:
+            return await find_youtube_match(title, artist, settings=settings)
+        except Exception:
+            return None
+
+    async def _search_archive():
+        if settings and not settings.enable_archive:
+            return []
+        try:
+            return await search_archive(query, limit=3)
+        except Exception:
+            return []
+
+    avaland_res, audius_res, sc_res, piped_res, yt_res, arch_res = await asyncio.gather(
+        _search_avaland(),
+        _search_audius(),
+        _search_soundcloud(),
+        _search_piped(),
+        _search_youtube(),
+        _search_archive(),
+    )
+
+    # ── 1) Avaland (highest priority) ──
+    if avaland_res and avaland_res.get("url"):
+        log.info(f"[MATCH] Avaland hit: {avaland_res.get('title', '')} from {avaland_res.get('source', '')}")
+        return {
+            "url": avaland_res["url"],
+            "download_url": avaland_res["url"],
+            "source": avaland_res.get("source", "Avaland"),
+            "title": avaland_res.get("title") or title,
+            "artist": avaland_res.get("artist") or artist,
+            "duration": avaland_res.get("duration", 0),
+        }
+
+    # ── 2) Audius ──
+    for r in (audius_res or []):
+        score = _match_score(title, r.get("title", ""))
+        if score >= 0.55:
+            log.info(f"[MATCH] Audius hit: {r['title'][:50]} (score={score:.2f})")
+            return {
+                "url": r.get("stream_url", ""),
+                "download_url": r.get("stream_url", ""),
+                "source": "Audius",
+                "title": r.get("title") or title,
+                "artist": r.get("artist") or artist,
+                "duration": r.get("duration", 0),
+            }
+
+    # ── 3) SoundCloud ──
+    for r in (sc_res or []):
         if not r.get("webpage_url"):
             continue
         dur = int(r.get("duration") or 0)
         if 0 < dur < 40:
             log.info(f"[MATCH] SoundCloud skip preview ({dur}s): {r.get('title', '')[:30]}")
             continue
-        score = fuzzy_ratio(title, r.get("title", ""))
+        score = _match_score(title, r.get("title", ""))
         if score >= 0.50:
             log.info(f"[MATCH] SoundCloud hit: {r.get('title', '')[:50]} (score={score:.2f})")
             return {
@@ -684,61 +744,47 @@ async def find_best_match(
                 "duration": dur,
             }
 
-    # 4) Piped (YouTube proxy)
-    if settings is None or settings.enable_piped:
-        try:
-            piped_results = await search_piped(query, limit=5)
-            for r in piped_results:
-                score = fuzzy_ratio(title, r.get("title", ""))
-                if score >= 0.50 and r.get("video_id"):
-                    stream_url = await piped_stream_url(r["video_id"])
-                    if stream_url:
-                        log.info(f"[MATCH] Piped hit: {r['title'][:50]} (score={score:.2f})")
-                        return {
-                            "url": f"https://www.youtube.com/watch?v={r['video_id']}",
-                            "download_url": stream_url,
-                            "source": "Piped",
-                            "title": r.get("title") or title,
-                            "artist": r.get("channel") or artist,
-                            "duration": r.get("duration", 0),
-                        }
-        except Exception as e:
-            log.warning(f"[MATCH] Piped error: {e}")
+    # ── 4) Piped ──
+    for r in (piped_res or []):
+        score = _match_score(title, r.get("title", ""))
+        if score >= 0.50 and r.get("video_id"):
+            stream_url = await piped_stream_url(r["video_id"])
+            if stream_url:
+                log.info(f"[MATCH] Piped hit: {r['title'][:50]} (score={score:.2f})")
+                return {
+                    "url": f"https://www.youtube.com/watch?v={r['video_id']}",
+                    "download_url": stream_url,
+                    "source": "Piped",
+                    "title": r.get("title") or title,
+                    "artist": r.get("channel") or artist,
+                    "duration": r.get("duration", 0),
+                }
 
-    # 5) YouTube (last resort — often blocked from datacenter IPs)
-    try:
-        yt = await find_youtube_match(title, artist, settings=settings)
-        if yt and yt.get("video_id"):
-            log.info(f"[MATCH] YouTube hit: {yt.get('title', '')[:50]}")
+    # ── 5) YouTube ──
+    if yt_res and yt_res.get("video_id"):
+        log.info(f"[MATCH] YouTube hit: {yt_res.get('title', '')[:50]}")
+        return {
+            "url": f"https://www.youtube.com/watch?v={yt_res['video_id']}",
+            "download_url": "",
+            "source": "YouTube",
+            "title": yt_res.get("title") or title,
+            "artist": yt_res.get("channel") or artist,
+            "duration": int(yt_res.get("duration") or 0),
+        }
+
+    # ── 6) Archive.org ──
+    for r in (arch_res or []):
+        score = _match_score(title, r.get("title", ""))
+        if score >= 0.50:
+            log.info(f"[MATCH] Archive hit: {r['title'][:50]} (score={score:.2f})")
             return {
-                "url": f"https://www.youtube.com/watch?v={yt['video_id']}",
-                "download_url": "",
-                "source": "YouTube",
-                "title": yt.get("title") or title,
-                "artist": yt.get("channel") or artist,
-                "duration": int(yt.get("duration") or 0),
+                "url": r.get("stream_url", ""),
+                "download_url": r.get("stream_url", ""),
+                "source": "Archive.org",
+                "title": r.get("title") or title,
+                "artist": artist,
+                "duration": 0,
             }
-    except Exception as e:
-        log.warning(f"[MATCH] YouTube search failed: {e}")
-
-    # 6) Archive.org
-    if settings is None or settings.enable_archive:
-        try:
-            arch_results = await search_archive(query, limit=3)
-            for r in arch_results:
-                score = fuzzy_ratio(title, r.get("title", ""))
-                if score >= 0.50:
-                    log.info(f"[MATCH] Archive hit: {r['title'][:50]} (score={score:.2f})")
-                    return {
-                        "url": r.get("stream_url", ""),
-                        "download_url": r.get("stream_url", ""),
-                        "source": "Archive.org",
-                        "title": r.get("title") or title,
-                        "artist": artist,
-                        "duration": 0,
-                    }
-        except Exception as e:
-            log.warning(f"[MATCH] Archive error: {e}")
 
     log.info("[MATCH] No match found in any source")
     return None
