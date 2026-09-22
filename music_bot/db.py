@@ -114,3 +114,52 @@ class DB:
             )
             await conn.commit()
         return await self.get_video_count_today(user_id)
+
+    async def get_stats(self) -> dict[str, Any]:
+        """Get bot usage statistics."""
+        from datetime import datetime
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        async with aiosqlite.connect(self.path) as conn:
+            # Total jobs
+            cur = await conn.execute("SELECT COUNT(*) FROM jobs")
+            total_jobs = (await cur.fetchone())[0]
+
+            # Today's jobs
+            cur = await conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE created_at >= ?", (today,)
+            )
+            today_jobs = (await cur.fetchone())[0]
+
+            # Unique users total
+            cur = await conn.execute("SELECT COUNT(DISTINCT user_id) FROM jobs")
+            total_users = (await cur.fetchone())[0]
+
+            # Today's unique users
+            cur = await conn.execute(
+                "SELECT COUNT(DISTINCT user_id) FROM jobs WHERE created_at >= ?", (today,)
+            )
+            today_users = (await cur.fetchone())[0]
+
+            # Video downloads today per user
+            cur = await conn.execute(
+                "SELECT user_id, video_count FROM daily_limits WHERE download_date = ?",
+                (today,),
+            )
+            video_users = await cur.fetchall()
+
+            # Jobs per user (all time)
+            cur = await conn.execute(
+                """SELECT user_id, COUNT(*) as cnt, status
+                   FROM jobs GROUP BY user_id ORDER BY cnt DESC LIMIT 20"""
+            )
+            user_jobs = await cur.fetchall()
+
+            return {
+                "total_jobs": total_jobs,
+                "today_jobs": today_jobs,
+                "total_users": total_users,
+                "today_users": today_users,
+                "video_users": [(r[0], r[1]) for r in video_users],
+                "user_jobs": [(r[0], r[1], r[2]) for r in user_jobs],
+            }

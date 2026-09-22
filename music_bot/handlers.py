@@ -141,6 +141,35 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             )
         await m.answer("\n".join(lines))
 
+    # ── /stats (admin only) ──
+
+    @router.message(Command("stats"))
+    async def cmd_stats(m: Message):
+        if not m.from_user or m.from_user.id not in settings.admin_ids:
+            return
+        stats = await db.get_stats()
+        lines = [
+            "📊 <b>آمار ربات:</b>",
+            "",
+            f"👥 کل کاربران: <b>{to_persian(stats['total_users'])}</b>",
+            f"📅 کاربران امروز: <b>{to_persian(stats['today_users'])}</b>",
+            f"📥 کل درخواست‌ها: <b>{to_persian(stats['total_jobs'])}</b>",
+            f"📥 درخواست‌های امروز: <b>{to_persian(stats['today_jobs'])}</b>",
+            "",
+        ]
+        # Video downloads today
+        if stats["video_users"]:
+            lines.append("🎬 <b>دانلود ویدیو امروز:</b>")
+            for uid, cnt in stats["video_users"]:
+                lines.append(f"  • <code>{to_persian(uid)}</code> — {to_persian(cnt)} ویدیو")
+            lines.append("")
+        # Top users
+        if stats["user_jobs"]:
+            lines.append("🏆 <b>فعال‌ترین کاربران:</b>")
+            for uid, cnt, _ in stats["user_jobs"][:10]:
+                lines.append(f"  • <code>{to_persian(uid)}</code> — {to_persian(cnt)} درخواست")
+        await m.answer("\n".join(lines), parse_mode="HTML")
+
     # ── Callback: help ──
 
     @router.callback_query(lambda c: c.data == "help")
