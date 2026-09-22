@@ -56,7 +56,7 @@ async def cb_yt_music(c: CallbackQuery, bot: Bot, settings: Settings) -> None:
 async def cb_yt_video(c: CallbackQuery, bot: Bot, settings: Settings) -> None:
     """User chose video from a YouTube link — show quality options."""
     short_id = c.data.split(":", 1)[1]
-    entry = yt_video_pending.get(short_id)
+    entry = yt_video_pending.pop(short_id, None)
     if not entry:
         await c.answer("منقضی شد.", show_alert=True)
         return

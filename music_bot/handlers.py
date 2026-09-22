@@ -33,7 +33,6 @@ from .keyboards import (
 from .shazam import identify_with_multi_segment
 from .sources import (
     find_best_match,
-    identify_track,
     is_instagram,
     is_soundcloud,
     is_spotify,
@@ -47,6 +46,41 @@ from .utils import clean_title, estimate_size_mb, sanitize_filename, to_persian
 from .video import handle_youtube_link, yt_video_pending
 
 log = logging.getLogger("music_bot.handlers")
+
+# ── Progress & message cleanup helpers ──
+
+_last_bot_msg: dict[int, int] = {}
+
+
+async def _cleanup_prev_msg(bot: Bot, chat_id: int) -> None:
+    """Delete the previous bot message in this chat."""
+    prev_id = _last_bot_msg.pop(chat_id, None)
+    if prev_id:
+        try:
+            await bot.delete_message(chat_id, prev_id)
+        except Exception:
+            pass
+
+
+def _track_msg(msg: Message, chat_id: int) -> None:
+    """Track a sent message for future cleanup."""
+    _last_bot_msg[chat_id] = msg.message_id
+
+
+async def _progress_task(bot: Bot, chat_id: int, msg_id: int, prefix: str) -> None:
+    """Background task: update message with progress percentage."""
+    persian = "۰۱۲۳۴۵۶۷۸۹"
+    for pct in [10, 25, 50, 75, 90]:
+        await asyncio.sleep(1.5)
+        fa_pct = "".join(persian[int(d)] for d in str(pct))
+        try:
+            await bot.edit_message_text(
+                f"{prefix}... {fa_pct}٪",
+                chat_id=chat_id,
+                message_id=msg_id,
+            )
+        except Exception:
+            break
 
 # Pending Instagram URL mapping: short_id -> (url, chat_id, user_id)
 instagram_pending: dict[str, tuple[str, int, int]] = {}
@@ -109,7 +143,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
     @router.callback_query(lambda c: c.data == "help")
     async def cb_help(c: CallbackQuery):
         await c.answer()
-        await c.message.answer(help_text())
+        await c.message.answer(help_text(), reply_markup=kb_main(c.from_user.id))
 
     # ── Callback: home ──
 
@@ -126,10 +160,12 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
     pending_search: set[int] = set()
 
     @router.callback_query(lambda c: c.data == "search")
-    async def cb_search(c: CallbackQuery):
+    async def cb_search(c: CallbackQuery, bot: Bot):
         pending_search.add(c.from_user.id)
         await c.answer()
-        await c.message.answer("🔎 نام آهنگ رو بفرست تا جستجو کنم:")
+        await _cleanup_prev_msg(bot, c.message.chat.id)
+        msg = await c.message.answer("🔎 نام آهنگ رو بفرست تا جستجو کنم:", reply_markup=kb_back())
+        _track_msg(msg, c.message.chat.id)
 
     # ── Instagram music ──
 
@@ -335,7 +371,8 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             await c.answer("درخواست منقضی شد.", show_alert=True)
             return
         await c.answer()
-        await c.message.edit_text("⬇️ در حال دانلود...", reply_markup=kb_back())
+        await c.message.edit_text("⬇️ در حال دانلود... ۱۰٪", reply_markup=kb_back())
+        progress = asyncio.create_task(_progress_task(bot, c.message.chat.id, c.message.message_id, "⬇️ در حال دانلود"))
         path = await _download_and_send(
             bot=bot,
             chat_id=c.message.chat.id,
@@ -347,7 +384,14 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             download_url=job.get("download_url") or "",
             source_name=job.get("source_name") or "",
             settings=settings,
+            db=db,
         )
+        # Cancel progress updates
+        progress.cancel()
+        try:
+            await progress
+        except asyncio.CancelledError:
+            pass
         if path:
             await c.message.edit_text(
                 "✅ ارسال کامل", reply_markup=kb_after_send(job_id)
@@ -375,8 +419,9 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         new_q = 128 if last_q == 320 else 320
         await c.answer()
         await c.message.edit_text(
-            "⬇️ در حال دانلود کیفیت دیگر...", reply_markup=kb_back()
+            "⬇️ در حال دانلود کیفیت دیگر... ۱۰٪", reply_markup=kb_back()
         )
+        progress = asyncio.create_task(_progress_task(bot, c.message.chat.id, c.message.message_id, "⬇️ در حال دانلود کیفیت دیگر"))
         path = await _download_and_send(
             bot=bot,
             chat_id=c.message.chat.id,
@@ -388,7 +433,14 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             download_url=job.get("download_url") or "",
             source_name=job.get("source_name") or "",
             settings=settings,
+            db=db,
         )
+        # Cancel progress updates
+        progress.cancel()
+        try:
+            await progress
+        except asyncio.CancelledError:
+            pass
         if path:
             await c.message.edit_text(
                 "✅ ارسال کامل", reply_markup=kb_after_send(job_id)
@@ -411,13 +463,15 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
     async def handle_text(m: Message, bot: Bot):
         if not m.from_user or not m.text:
             return
+        # Cleanup previous bot message
+        await _cleanup_prev_msg(bot, m.chat.id)
         uid = m.from_user.id
         txt = m.text.strip()
 
         # Check if user is in search mode
         if uid in pending_search:
             pending_search.discard(uid)
-            await process_search(m, txt, settings)
+            await process_search(m, txt, settings, bot)
             return
 
         # Must be a URL
@@ -452,7 +506,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
 
         # TikTok, Spotify, SoundCloud: identify music
         if is_tiktok(url) or is_spotify(url) or is_soundcloud(url):
-            await process_identify(m, bot, url, settings)
+            await process_identify(m, bot, url, settings, db)
             return
 
         # Twitter/X
@@ -468,7 +522,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             return
 
         # Direct URL (unknown but supported)
-        await process_url_direct(m, bot, url, settings)
+        await process_url_direct(m, bot, url, settings, db)
 
 
 # ═══════════════════════════════════════════════════
@@ -516,8 +570,6 @@ async def identify_music_with_shazam(url: str) -> dict[str, Any] | None:
         return None
 
     # Others: download probe audio and Shazam segments
-    from .downloader import download_audio
-
     probe = await _download_probe_audio(url, str(probe_root))
     if probe:
         res = await identify_with_multi_segment(probe, probe_root)
@@ -558,7 +610,7 @@ async def _download_probe_audio(source_url: str, dest: str) -> str | None:
     return await asyncio.to_thread(_work)
 
 
-async def process_identify(m: Message, bot: Bot, url: str, settings: Settings) -> None:
+async def process_identify(m: Message, bot: Bot, url: str, settings: Settings, db: DB) -> None:
     """Shazam the music from a link, then find & download it."""
     from .keyboards import kb_back
 
@@ -633,46 +685,49 @@ async def process_identify(m: Message, bot: Bot, url: str, settings: Settings) -
     )
 
 
-async def process_search(m: Message, query: str, settings: Settings) -> None:
+async def process_search(m: Message, query: str, settings: Settings, bot: Bot) -> None:
     """Search YouTube and show results."""
     from .sources import search_youtube
 
     status = await m.answer(
-        f"🔍 در حال جستجوی «{query}»\n⏳ لطفاً صبر کنید...",
+        f"🔍 در حال جستجوی «{query}»... ۱۰٪",
         reply_markup=kb_back(),
     )
+    _track_msg(status, m.chat.id)
+    progress = asyncio.create_task(_progress_task(bot, m.chat.id, status.message_id, f"🔍 در حال جستجوی «{query}»"))
 
     seen_ids: set[str] = set()
     all_results: list[dict[str, Any]] = []
 
-    # Search 1: original query
-    try:
-        res1 = await search_youtube(query, limit=6, settings=settings)
-    except Exception:
-        res1 = []
-    for r in res1 or []:
-        vid = r.get("video_id", "")
-        if vid and vid not in seen_ids:
-            seen_ids.add(vid)
-            all_results.append(r)
-
-    # Search 2: popular songs (if query looks like artist name)
+    # Determine if we should also search "popular songs"
     song_indicators = [
         "official", "video", "audio", "lyric", "remix", "live", "cover", "amv", "mv",
     ]
     is_likely_artist = not any(ind in query.lower() for ind in song_indicators) and len(query.split()) <= 4
+
+    # Run both searches in parallel
+    searches = [search_youtube(query, limit=6, settings=settings)]
     if is_likely_artist:
-        try:
-            res2 = await search_youtube(f"{query} popular songs", limit=6, settings=settings)
-        except Exception:
-            res2 = []
-        for r in res2 or []:
+        searches.append(search_youtube(f"{query} popular songs", limit=6, settings=settings))
+    results_list = await asyncio.gather(*searches, return_exceptions=True)
+
+    for res in results_list:
+        if isinstance(res, Exception):
+            continue
+        for r in res or []:
             vid = r.get("video_id", "")
             if vid and vid not in seen_ids:
                 seen_ids.add(vid)
                 all_results.append(r)
 
     all_results = all_results[:6]
+
+    # Cancel progress updates
+    progress.cancel()
+    try:
+        await progress
+    except asyncio.CancelledError:
+        pass
 
     if not all_results:
         await status.edit_text(
@@ -702,7 +757,7 @@ async def process_search(m: Message, query: str, settings: Settings) -> None:
     )
 
 
-async def process_url_direct(m: Message, bot: Bot, url: str, settings: Settings) -> None:
+async def process_url_direct(m: Message, bot: Bot, url: str, settings: Settings, db: DB) -> None:
     """Handle a direct URL — probe, create job, show quality options."""
     from .keyboards import kb_back
 
@@ -759,6 +814,7 @@ async def _download_and_send(
     download_url: str = "",
     source_name: str = "",
     settings: Settings | None = None,
+    db: DB | None = None,
 ) -> str | None:
     """Download audio and send it to the chat."""
     from .keyboards import kb_back
@@ -851,6 +907,7 @@ async def _download_and_send(
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
-    await db.update_job(job_id, status="sent")
+    if db:
+        await db.update_job(job_id, status="sent")
     last_quality_by_job[job_id] = quality
     return str(src)

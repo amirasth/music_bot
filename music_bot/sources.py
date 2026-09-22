@@ -302,7 +302,7 @@ async def search_audius(query: str, limit: int = 5) -> list[dict[str, Any]]:
             log.warning(f"[AUDIUS] Search error: {e}")
             return []
 
-    return await asyncio.to_thread(lambda: asyncio.get_event_loop().run_until_complete(_work()))
+    return await _work()
 
 
 async def search_audius_async(query: str, limit: int = 5) -> list[dict[str, Any]]:
@@ -364,6 +364,7 @@ async def search_soundcloud(query: str, limit: int = 5) -> list[dict[str, Any]]:
             "noprogress": True,
             "no_warnings": True,
             "skip_download": True,
+            "socket_timeout": 8,
         }
         try:
             with YoutubeDL(opts) as ydl:
@@ -404,7 +405,7 @@ async def search_piped(query: str, limit: int = 5) -> list[dict[str, Any]]:
                 async with session.get(
                     url,
                     params=params,
-                    timeout=aiohttp.ClientTimeout(total=12),
+                    timeout=aiohttp.ClientTimeout(total=8),
                 ) as resp:
                     if resp.status != 200:
                         return []
@@ -432,7 +433,18 @@ async def search_piped(query: str, limit: int = 5) -> list[dict[str, Any]]:
         except Exception:
             return []
 
-    for instance in PIPED_INSTANCES:
+    # Try first 2 instances in parallel for speed
+    batch1 = await asyncio.gather(
+        _try_instance(PIPED_INSTANCES[0]),
+        _try_instance(PIPED_INSTANCES[1]),
+    )
+    for results in batch1:
+        if results:
+            log.info(f"[PIPED] Got {len(results)} results")
+            return results
+
+    # Fallback: try remaining instances sequentially
+    for instance in PIPED_INSTANCES[2:]:
         results = await _try_instance(instance)
         if results:
             log.info(f"[PIPED] Got {len(results)} results from {instance}")
