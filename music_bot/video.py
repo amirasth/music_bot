@@ -77,7 +77,7 @@ async def cb_yt_video(c: CallbackQuery, bot: Bot, settings: Settings) -> None:
     )
 
 
-async def cb_ytdl(c: CallbackQuery, bot: Bot, settings: Settings) -> None:
+async def cb_ytdl(c: CallbackQuery, bot: Bot, settings: Settings, db=None) -> None:
     """Download YouTube video at selected quality."""
     try:
         _, short_id, h_s = c.data.split(":")
@@ -91,6 +91,17 @@ async def cb_ytdl(c: CallbackQuery, bot: Bot, settings: Settings) -> None:
         return
     url, _chat_id = entry
     await c.answer()
+    # Check daily video limit for non-admins
+    uid = c.from_user.id if c.from_user else 0
+    if db and uid not in settings.admin_ids:
+        count = await db.get_video_count_today(uid)
+        if count >= 3:
+            await c.message.edit_text(
+                "🚫 به محدودیت استفاده روزانه رسیدید (۳ کلیپ/ویدیو در روز).\n"
+                "⏰ محدودیت ساعت ۱۲ شب ریست میشه.",
+                reply_markup=kb_back(),
+            )
+            return
     status = await c.message.edit_text(
         f"⬇️ در حال دانلود ویدیو ({to_persian(height)}p)...",
         reply_markup=kb_back(),
@@ -120,6 +131,8 @@ async def cb_ytdl(c: CallbackQuery, bot: Bot, settings: Settings) -> None:
                 caption=f"🎬 {to_persian(height)}p • 📦 {to_persian(round(size_mb, 1))} MB\n🎧 @ASmusic_robot",
                 supports_streaming=True,
             )
+            if db and uid not in settings.admin_ids:
+                await db.increment_video_count(uid)
             await status.delete()
         except Exception as e:
             await status.edit_text(f"❌ ارسال ناموفق: {e}", reply_markup=kb_back())
@@ -131,9 +144,21 @@ async def cb_ytdl(c: CallbackQuery, bot: Bot, settings: Settings) -> None:
 # ── Twitter / X ──
 
 
-async def process_tweet(m: Message, bot: Bot, url: str) -> None:
+async def process_tweet(m: Message, bot: Bot, url: str, db=None, settings=None) -> None:
     """X/Twitter post: fetch via FxTwitter API, reply with text + media."""
     from .keyboards import kb_back
+
+    # Check daily video limit for non-admins
+    uid = m.from_user.id if m.from_user else 0
+    if db and settings and uid not in settings.admin_ids:
+        count = await db.get_video_count_today(uid)
+        if count >= 3:
+            await m.answer(
+                "🚫 به محدودیت استفاده روزانه رسیدید (۳ کلیپ/ویدیو در روز).\n"
+                "⏰ محدودیت ساعت ۱۲ شب ریست میشه.",
+                reply_markup=kb_back(),
+            )
+            return
 
     status = await m.answer("🐦 در حال خواندن پست از ایکس...", reply_markup=kb_back())
 
@@ -197,6 +222,8 @@ async def process_tweet(m: Message, bot: Bot, url: str) -> None:
                     caption=caption[:1024],
                     parse_mode="HTML",
                 )
+                if db and settings and uid not in settings.admin_ids:
+                    await db.increment_video_count(uid)
                 if len(vids) > 1:
                     for v in vids[1:4]:
                         vu = v.get("url") or ""

@@ -237,6 +237,16 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             return
         original_url, chat_id, user_id = entry
         await c.answer()
+        # Check daily video limit for non-admins
+        if user_id not in settings.admin_ids:
+            count = await db.get_video_count_today(user_id)
+            if count >= 3:
+                await c.message.edit_text(
+                    "🚫 به محدودیت استفاده روزانه رسیدید (۳ کلیپ/ویدیو در روز).\n"
+                    "⏰ محدودیت ساعت ۱۲ شب ریست میشه.",
+                    reply_markup=kb_back(),
+                )
+                return
         await c.message.edit_text("🎬 در حال دانلود کلیپ اینستاگرام...")
         root = Path(tempfile.gettempdir()) / "ig_video" / str(abs(hash(original_url)))
         root.mkdir(parents=True, exist_ok=True)
@@ -282,6 +292,8 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
                 caption=f"🎬 کلیپ اینستاگرام\n📦 {round(size_mb, 1)} MB\n🎧 @ASmusic_robot",
                 supports_streaming=True,
             )
+            if user_id not in settings.admin_ids:
+                await db.increment_video_count(user_id)
         except Exception as e:
             await c.message.edit_text(
                 f"❌ ارسال ناموفق: {e}", reply_markup=kb_back()
@@ -311,7 +323,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
     async def cb_ytdl(c: CallbackQuery, bot: Bot):
         from .video import cb_ytdl as _cb
 
-        await _cb(c, bot, settings)
+        await _cb(c, bot, settings, db)
 
     # ── Search result download ──
 
@@ -516,7 +528,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         if is_twitter(url):
             from .video import process_tweet
 
-            await process_tweet(m, bot, url)
+            await process_tweet(m, bot, url, db, settings)
             return
 
         # YouTube: ask music or video

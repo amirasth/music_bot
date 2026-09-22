@@ -24,6 +24,15 @@ CREATE TABLE IF NOT EXISTS jobs (
 )
 """
 
+CREATE_DAILY_LIMITS = """
+CREATE TABLE IF NOT EXISTS daily_limits (
+    user_id INTEGER NOT NULL,
+    download_date TEXT NOT NULL,
+    video_count INTEGER DEFAULT 0,
+    PRIMARY KEY (user_id, download_date)
+)
+"""
+
 
 class DB:
     def __init__(self, path: str):
@@ -32,6 +41,7 @@ class DB:
     async def init(self) -> None:
         async with aiosqlite.connect(self.path) as conn:
             await conn.execute(CREATE_TABLE)
+            await conn.execute(CREATE_DAILY_LIMITS)
             await conn.commit()
         log.info(f"[DB] Initialized at {self.path}")
 
@@ -75,3 +85,32 @@ class DB:
             )
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
+
+    async def get_video_count_today(self, user_id: int) -> int:
+        """Get how many videos/clips a user downloaded today."""
+        from datetime import datetime
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "SELECT video_count FROM daily_limits WHERE user_id = ? AND download_date = ?",
+                (user_id, today),
+            )
+            row = await cur.fetchone()
+            return int(row[0]) if row else 0
+
+    async def increment_video_count(self, user_id: int) -> int:
+        """Increment and return today's video count for a user."""
+        from datetime import datetime
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(
+                """INSERT INTO daily_limits (user_id, download_date, video_count)
+                   VALUES (?, ?, 1)
+                   ON CONFLICT(user_id, download_date)
+                   DO UPDATE SET video_count = video_count + 1""",
+                (user_id, today),
+            )
+            await conn.commit()
+        return await self.get_video_count_today(user_id)
