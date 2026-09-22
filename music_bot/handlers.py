@@ -375,14 +375,17 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
 
     @router.callback_query(lambda c: c.data.startswith("dl:"))
     async def cb_download(c: CallbackQuery, bot: Bot):
+        log.info(f"[DL] Callback data: {c.data}")
         try:
             _, job_id_s, q_s = c.data.split(":")
             job_id, quality = int(job_id_s), int(q_s)
         except Exception:
             await c.answer("درخواست نامعتبر.", show_alert=True)
             return
+        log.info(f"[DL] Looking up job_id={job_id}, quality={quality}")
         job = await db.get_job(job_id)
         if not job:
+            log.warning(f"[DL] Job {job_id} not found in database!")
             await c.answer("درخواست منقضی شد.", show_alert=True)
             return
         await c.answer()

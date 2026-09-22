@@ -56,7 +56,7 @@ async def cb_yt_music(c: CallbackQuery, bot: Bot, settings: Settings) -> None:
 async def cb_yt_video(c: CallbackQuery, bot: Bot, settings: Settings) -> None:
     """User chose video from a YouTube link — show quality options."""
     short_id = c.data.split(":", 1)[1]
-    entry = yt_video_pending.pop(short_id, None)
+    entry = yt_video_pending.get(short_id)
     if not entry:
         await c.answer("منقضی شد.", show_alert=True)
         return
@@ -65,6 +65,7 @@ async def cb_yt_video(c: CallbackQuery, bot: Bot, settings: Settings) -> None:
     meta = await probe_url(url, settings)
     duration = int((meta or {}).get("duration") or 0)
     if duration and duration > settings.max_duration_min * 60:
+        yt_video_pending.pop(short_id, None)
         await c.message.edit_text(
             f"⏱ ویدیو بیش از {to_persian(settings.max_duration_min)} دقیقه است.",
             reply_markup=kb_back(),
