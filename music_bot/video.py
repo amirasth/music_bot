@@ -16,7 +16,7 @@ from aiogram.types import CallbackQuery, FSInputFile, Message
 from .config import Settings
 from .downloader import download_youtube_video, probe_url
 from .http import get_session
-from .keyboards import kb_back, kb_video_quality, kb_youtube_choice
+from .keyboards import kb_back, kb_clip_quality, kb_video_quality, kb_youtube_choice
 from .state import PendingStore
 from .utils import to_persian
 
@@ -24,6 +24,10 @@ log = logging.getLogger("music_bot.video")
 
 # Pending YouTube selections: token -> url, owned by the user who sent the link.
 yt_video_pending = PendingStore()
+
+# Pending X/Twitter video posts awaiting a quality choice; the resolved tweet is
+# held so the callback does not have to re-fetch it.
+x_clip_pending = PendingStore()
 
 DAILY_VIDEO_LIMIT = 3
 
@@ -172,6 +176,9 @@ _TWEET_URL_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+# Twitter rendition paths look like .../vid/avc1/1280x720/name.mp4
+_RES_RE = re.compile(r"/(\d+)x(\d+)/")
+
 
 def _https(u: str) -> str:
     u = (u or "").strip()
@@ -189,32 +196,34 @@ def _photo_variants(u: str) -> list[str]:
     return [f"{base}?name=orig", f"{base}?name=large", f"{base}?name=medium"]
 
 
-def _video_variants(v: dict) -> list[str]:
-    """Direct mp4 renditions, best-first; drops the unusable m3u8 HLS playlist.
+def _video_variants(v: dict) -> list[tuple[str, int, int]]:
+    """Direct mp4 renditions as (url, height, estimated_bytes), best-first.
 
-    Telegram cannot play an HLS manifest and FxTwitter reports no size for
-    them, so only progressive `mp4` entries qualify. Where a bitrate is known
-    the duration yields an estimated size, which keeps a 4K rendition from
-    being downloaded only to be rejected as too large.
+    Drops the m3u8 HLS playlist: Telegram cannot play a manifest and FxTwitter
+    reports no size for it. Height comes from the rendition path
+    (`/1280x720/`), and the bitrate plus duration yields an estimated size so a
+    4K rendition is not downloaded only to be rejected as too large.
     """
     duration = v.get("duration") or 0
-    scored: list[tuple[float, str]] = []
+    scored: list[tuple[int, float, str]] = []
     for f in v.get("formats") or []:
         if (f.get("container") or "").lower() != "mp4":
             continue
         u = _https(f.get("url") or "")
         if not u:
             continue
+        m = _RES_RE.search(u)
+        height = int(m.group(2)) if m else 0
         bitrate = f.get("bitrate") or 0
-        est = (bitrate / 8) * duration if bitrate and duration else 0
-        scored.append((est, u))
-    scored.sort(key=lambda s: s[0] or float("inf"), reverse=True)
+        est = int((bitrate / 8) * duration) if bitrate and duration else 0
+        scored.append((height, est, u))
+    scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
 
-    urls = [u for _, u in scored]
+    out = [(u, h, e) for h, e, u in scored]
     main = _https(v.get("url") or "")
-    if main and main not in urls:
-        urls.append(main)
-    return urls
+    if main and main not in {u for u, _, _ in out}:
+        out.append((main, 0, 0))
+    return out
 
 
 async def _probe_size(url: str) -> int | None:
@@ -272,11 +281,26 @@ async def _fetch_media(
     return "", "", False
 
 
-async def _pick_video(v: dict, tmp: str) -> tuple[str | None, bool]:
-    """Download the best rendition that fits the upload cap. Returns (path, oversized)."""
+async def _pick_video(v: dict, tmp: str, quality: str = "orig") -> tuple[str | None, bool]:
+    """Download the requested rendition. Returns (path, oversized).
+
+    `quality` is "orig" for the best available or "480" for a small rendition.
+    Candidates go best-first (or nearest-to-480 first), each falling through to
+    the next when it is too big or fails to download.
+    """
     cap = _TWITTER_VIDEO_CAP_MB * 1024 * 1024
+    variants = _video_variants(v)
+    if quality == "480":
+        # Closest at-or-below 480p first; if every rendition is larger, take the
+        # smallest available rather than failing outright.
+        small = [t for t in variants if 0 < t[1] <= 480]
+        small.sort(key=lambda t: (t[1], t[2]), reverse=True)
+        rest = [t for t in variants if not (0 < t[1] <= 480)]
+        rest.sort(key=lambda t: t[1] or 10**6)
+        variants = small + rest
+
     oversized = False
-    for i, u in enumerate(_video_variants(v)):
+    for i, (u, _, _) in enumerate(variants):
         size = await _probe_size(u)
         if size and size > cap:
             oversized = True
@@ -347,11 +371,8 @@ async def _fetch_tweet(url: str) -> dict:
 async def process_tweet(m: Message, bot: Bot, url: str, db=None, settings=None) -> None:
     """X/Twitter post: fetch via FxTwitter API, reply with text + media."""
     uid = m.from_user.id if m.from_user else 0
-    if db and settings and uid not in settings.admin_ids:
-        count = await db.get_video_count_today(uid)
-        if count >= DAILY_VIDEO_LIMIT:
-            await m.answer(_limit_message(), reply_markup=kb_back())
-            return
+    # The daily quota is spent on a clip download, which happens in cb_x_clip
+    # after the quality pick — reading a post's text or photos is free.
 
     status = await m.answer("🐦 در حال خواندن پست از ایکس...", reply_markup=kb_back())
 
@@ -379,37 +400,26 @@ async def process_tweet(m: Message, bot: Bot, url: str, db=None, settings=None) 
     vids = media.get("videos") or []
     photos = media.get("photos") or []
 
+    # A video post is delivered via an explicit quality choice, so the download
+    # only starts once the user has picked. The tweet itself is kept in the
+    # pending store: re-fetching it on the callback would duplicate the API
+    # call and could resolve to a different payload.
+    if vids:
+        token = uuid.uuid4().hex[:8]
+        x_clip_pending.put(
+            token,
+            {"vids": vids, "photos": photos, "caption": caption},
+            user_id=uid,
+            chat_id=m.chat.id,
+        )
+        await status.edit_text(
+            "🎬 کیفیت کلیپ رو انتخاب کن:", reply_markup=kb_clip_quality("xclip", token)
+        )
+        return
+
     tmp = Path(tempfile.gettempdir()) / "tweet" / uuid.uuid4().hex
     tmp.mkdir(parents=True, exist_ok=True)
     try:
-        if vids:
-            path, oversized = await _pick_video(vids[0], str(tmp))
-            if path:
-                try:
-                    await m.answer_video(
-                        video=FSInputFile(path),
-                        caption=caption[:1024],
-                        parse_mode="HTML",
-                    )
-                except Exception as e:
-                    log.warning(f"[X] send video failed: {e}")
-                    await _report(m, status, "❌ ارسال ویدیو ناموفق بود.")
-                    return
-                if db and settings and uid not in settings.admin_ids:
-                    await db.increment_video_count(uid)
-                for i, v in enumerate(vids[1:4], start=1):
-                    extra, _ = await _pick_video(v, str(tmp))
-                    if extra:
-                        with contextlib.suppress(Exception):
-                            await m.answer_video(video=FSInputFile(extra))
-                await _send_photos(m, photos, str(tmp), caption=None)
-                with contextlib.suppress(Exception):
-                    await status.delete()
-                return
-            if oversized:
-                await _report(m, status, "📦 حجم ویدیو از محدودیت ارسال تلگرام بیشتره.")
-                return
-
         if photos:
             sent = await _send_photos(m, photos, str(tmp), caption=caption)
             if sent:
@@ -426,20 +436,109 @@ async def process_tweet(m: Message, bot: Bot, url: str, db=None, settings=None) 
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+async def cb_x_clip(c: CallbackQuery, bot: Bot, settings: Settings, db=None) -> None:
+    """Deliver an X/Twitter video post at the quality the user picked."""
+    try:
+        _, token, quality = c.data.split(":")
+    except ValueError:
+        await c.answer("درخواست نامعتبر.", show_alert=True)
+        return
+    entry = x_clip_pending.take(token, user_id=c.from_user.id)
+    if entry is None:
+        await c.answer("منقضی شد یا لینک نامعتبر است.", show_alert=True)
+        return
+    payload = entry.value
+    chat_id = entry.chat_id
+    uid = entry.user_id
+    await c.answer()
+
+    if db and uid not in settings.admin_ids:
+        count = await db.get_video_count_today(uid)
+        if count >= DAILY_VIDEO_LIMIT:
+            await c.message.edit_text(_limit_message(), reply_markup=kb_back())
+            return
+
+    vids = payload.get("vids") or []
+    photos = payload.get("photos") or []
+    caption = payload.get("caption") or ""
+
+    await c.message.edit_text("⬇️ در حال دانلود کلیپ...")
+    tmp = Path(tempfile.gettempdir()) / "tweet" / uuid.uuid4().hex
+    tmp.mkdir(parents=True, exist_ok=True)
+    try:
+        path, oversized = await _pick_video(vids[0], str(tmp), quality)
+        if not path:
+            await c.message.edit_text(
+                "📦 حجم کلیپ از محدودیت ارسال تلگرام بیشتره." if oversized
+                else "❌ دانلود کلیپ ناموفق بود.",
+                reply_markup=kb_back(),
+            )
+            return
+        size_mb = Path(path).stat().st_size / (1024 * 1024)
+        await c.message.edit_text(f"⬆️ در حال ارسال ({to_persian(round(size_mb, 1))} مگ)...")
+        try:
+            await bot.send_video(
+                chat_id=chat_id,
+                video=FSInputFile(path),
+                caption=caption[:1024],
+                parse_mode="HTML",
+                supports_streaming=True,
+            )
+        except Exception as e:
+            log.warning(f"[X] send video failed: {e}")
+            await c.message.edit_text("❌ ارسال کلیپ ناموفق بود.", reply_markup=kb_back())
+            return
+        if db and uid not in settings.admin_ids:
+            await db.increment_video_count(uid)
+        for i, v in enumerate(vids[1:4], start=1):
+            extra, _ = await _pick_video(v, str(tmp), quality)
+            if extra:
+                with contextlib.suppress(Exception):
+                    await bot.send_video(chat_id=chat_id, video=FSInputFile(extra))
+        await _send_photos_msg(bot, chat_id, photos, str(tmp), caption=None)
+        with contextlib.suppress(Exception):
+            await c.message.delete()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def _send_photos(m: Message, photos: list, tmp: str, caption: str | None) -> bool:
     """Send up to six photos; the caption rides the first one that uploads."""
+    async def _send(path: str, cap: str | None) -> None:
+        if cap:
+            await m.answer_photo(
+                FSInputFile(path), caption=cap[:1024], parse_mode="HTML"
+            )
+        else:
+            await m.answer_photo(FSInputFile(path))
+
+    return await _send_photo_list(photos, tmp, caption, _send)
+
+
+async def _send_photos_msg(
+    bot: Bot, chat_id: int, photos: list, tmp: str, caption: str | None
+) -> bool:
+    """Photo sender for the callback path, which has no Message to reply to."""
+    async def _send(path: str, cap: str | None) -> None:
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=FSInputFile(path),
+            caption=(cap[:1024] if cap else None),
+            parse_mode="HTML" if cap else None,
+        )
+
+    return await _send_photo_list(photos, tmp, caption, _send)
+
+
+async def _send_photo_list(photos: list, tmp: str, caption: str | None, send) -> bool:
+    """Download and send photos, sharing the caption and surviving per-photo failure."""
     sent = False
     for i, p in enumerate(photos[:6]):
         path = await _pick_photo(p, tmp, i)
         if not path:
             continue
         try:
-            if caption and not sent:
-                await m.answer_photo(
-                    FSInputFile(path), caption=caption[:1024], parse_mode="HTML"
-                )
-            else:
-                await m.answer_photo(FSInputFile(path))
+            await send(path, caption if not sent else None)
         except Exception as e:
             log.warning(f"[X] send photo failed: {e}")
             continue

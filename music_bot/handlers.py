@@ -26,6 +26,7 @@ from .keyboards import (
     help_text,
     kb_after_send,
     kb_back,
+    kb_clip_quality,
     kb_instagram_choice,
     kb_main,
     kb_quality,
@@ -50,7 +51,7 @@ from .utils import (
     sanitize_filename,
     to_persian,
 )
-from .video import handle_youtube_link
+from .video import DAILY_VIDEO_LIMIT, handle_youtube_link
 
 log = logging.getLogger("music_bot.handlers")
 
@@ -91,6 +92,9 @@ async def _progress_task(bot: Bot, chat_id: int, msg_id: int, prefix: str) -> No
 
 # Pending Instagram URL mapping: short_id -> (url, chat_id, user_id)
 instagram_pending = PendingStore()
+
+# Instagram clips awaiting a quality choice: token -> url
+ig_clip_pending = PendingStore()
 
 # Track last quality used per job for retry toggle
 last_quality_by_job: dict[int, int] = {}
@@ -148,6 +152,25 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             )
         await m.answer("\n".join(lines))
 
+    # ── /info (admin only) ──
+
+    @router.message(Command("info"))
+    async def cmd_info(m: Message):
+        if not m.from_user or m.from_user.id not in settings.admin_ids:
+            return
+        stats = await db.get_stats()
+        lines = [
+            "📊 <b>وضعیت ربات:</b>",
+            "",
+            f"👥 کاربران فعال امروز: <b>{to_persian(stats['today_users'])}</b>",
+            f"👥 کل کاربران: <b>{to_persian(stats['total_users'])}</b>",
+            "",
+            f"📥 درخواست‌های امروز: <b>{to_persian(stats['today_jobs'])}</b>",
+            f"🎬 کلیپ/ویدیو امروز: <b>{to_persian(stats['today_videos'])}</b>",
+            f"📥 کل درخواست‌ها: <b>{to_persian(stats['total_jobs'])}</b>",
+        ]
+        await m.answer("\n".join(lines), parse_mode="HTML")
+
     # ── /stats (admin only) ──
 
     @router.message(Command("stats"))
@@ -173,7 +196,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         # Top users
         if stats["user_jobs"]:
             lines.append("🏆 <b>فعال‌ترین کاربران:</b>")
-            for uid, cnt, _ in stats["user_jobs"][:10]:
+            for uid, cnt in stats["user_jobs"][:10]:
                 lines.append(f"  • <code>{to_persian(uid)}</code> — {to_persian(cnt)} درخواست")
         await m.answer("\n".join(lines), parse_mode="HTML")
 
@@ -275,10 +298,36 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         original_url, chat_id = entry.value, entry.chat_id
         user_id = entry.user_id
         await c.answer()
+        # The download only starts after the quality pick, so the URL is moved
+        # into a fresh token rather than being downloaded now.
+        ig_clip_pending.put(
+            url_part, original_url, user_id=user_id, chat_id=chat_id
+        )
+        await c.message.edit_text(
+            "🎬 کیفیت کلیپ رو انتخاب کن:",
+            reply_markup=kb_clip_quality("igclip", url_part),
+        )
+
+    # ── Instagram clip quality ──
+
+    @router.callback_query(lambda c: c.data.startswith("igclip:"))
+    async def cb_ig_clip(c: CallbackQuery, bot: Bot):
+        try:
+            _, token, quality = c.data.split(":")
+        except ValueError:
+            await c.answer("درخواست نامعتبر.", show_alert=True)
+            return
+        entry = ig_clip_pending.take(token, user_id=c.from_user.id)
+        if entry is None:
+            await c.answer("منقضی شد یا لینک نامعتبر است.", show_alert=True)
+            return
+        original_url, chat_id = entry.value, entry.chat_id
+        user_id = entry.user_id
+        await c.answer()
         # Check daily video limit for non-admins
         if user_id not in settings.admin_ids:
             count = await db.get_video_count_today(user_id)
-            if count >= 3:
+            if count >= DAILY_VIDEO_LIMIT:
                 await c.message.edit_text(
                     "🚫 به محدودیت استفاده روزانه رسیدید (۳ کلیپ/ویدیو در روز).\n"
                     "⏰ محدودیت ساعت ۱۲ شب ریست میشه.",
@@ -292,6 +341,15 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         root = Path(tempfile.gettempdir()) / "ig_video" / uuid.uuid4().hex
         root.mkdir(parents=True, exist_ok=True)
 
+        # "orig" is the best single-file stream yt-dlp can hand over; the
+        # low-bandwidth option caps the height, since Instagram does not offer
+        # a labelled 480p rendition the way YouTube does.
+        fmt = (
+            "best[height<=480]/bestvideo[height<=480]+bestaudio/best"
+            if quality == "480"
+            else "bestvideo+bestaudio/best"
+        )
+
         def _work():
             try:
                 from yt_dlp import YoutubeDL  # type: ignore
@@ -299,7 +357,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
                 return None
             outtmpl = str(root / "video.%(ext)s")
             opts = {
-                "format": "bestvideo+bestaudio/best",
+                "format": fmt,
                 "outtmpl": outtmpl,
                 "merge_output_format": "mp4",
                 "quiet": True,
@@ -323,14 +381,17 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
                 return
             src = Path(path)
             size_mb = src.stat().st_size / (1024 * 1024)
-            if size_mb > settings.max_file_mb:
+            if size_mb > settings.max_video_mb:
                 await c.message.edit_text(
                     f"📦 حجم کلیپ {to_persian(round(size_mb))} مگابایت است — "
-                    f"بیشتر از محدودیت {to_persian(settings.max_file_mb)} مگابایتی.",
+                    f"بیشتر از محدودیت {to_persian(settings.max_video_mb)} مگابایتی.\n"
+                    "گزینه کم‌حجم رو امتحان کن.",
                     reply_markup=kb_back(),
                 )
                 return
-            await c.message.edit_text("⬆️ در حال ارسال...")
+            await c.message.edit_text(
+                f"⬆️ در حال ارسال ({to_persian(round(size_mb, 1))} مگ)..."
+            )
             try:
                 await bot.send_video(
                     chat_id=chat_id,
@@ -368,6 +429,14 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
     @router.callback_query(lambda c: c.data.startswith("ytdl:"))
     async def cb_ytdl(c: CallbackQuery, bot: Bot):
         from .video import cb_ytdl as _cb
+
+        await _cb(c, bot, settings, db)
+
+    # ── X/Twitter clip quality ──
+
+    @router.callback_query(lambda c: c.data.startswith("xclip:"))
+    async def cb_x_clip(c: CallbackQuery, bot: Bot):
+        from .video import cb_x_clip as _cb
 
         await _cb(c, bot, settings, db)
 

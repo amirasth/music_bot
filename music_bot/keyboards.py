@@ -96,6 +96,24 @@ def kb_youtube_choice(short_id: str) -> InlineKeyboardMarkup:
     )
 
 
+def kb_clip_quality(prefix: str, token: str) -> InlineKeyboardMarkup:
+    """Clip quality for Instagram/X: small rendition or the original."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📉 کم‌حجم (۴۸۰p)",
+                    callback_data=f"{prefix}:{token}:480",
+                ),
+                InlineKeyboardButton(
+                    text="🎬 اصلی",
+                    callback_data=f"{prefix}:{token}:orig",
+                ),
+            ],
+        ]
+    )
+
+
 def kb_instagram_choice(short_id: str) -> InlineKeyboardMarkup:
     """Instagram link: music or clip?"""
     return InlineKeyboardMarkup(

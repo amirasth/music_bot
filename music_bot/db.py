@@ -159,26 +159,28 @@ class DB:
         """Get bot usage statistics."""
         today = self._today_local()
         day_start = self._utc_day_start()
+        # Everyone who has ever downloaded a video/clip today, whether or not
+        # their job row survived — this is the truer "active user" signal than
+        # the jobs table, which only records links that reached the queue.
+        active_today = (
+            "SELECT COUNT(DISTINCT user_id) FROM ("
+            "  SELECT user_id FROM jobs WHERE created_at >= ?"
+            "  UNION SELECT user_id FROM daily_limits WHERE download_date = ?"
+            ")"
+        )
         async with aiosqlite.connect(self.path) as conn:
-            # Total jobs
             cur = await conn.execute("SELECT COUNT(*) FROM jobs")
             total_jobs = (await cur.fetchone())[0]
 
-            # Today's jobs
             cur = await conn.execute(
                 "SELECT COUNT(*) FROM jobs WHERE created_at >= ?", (day_start,)
             )
             today_jobs = (await cur.fetchone())[0]
 
-            # Unique users total
             cur = await conn.execute("SELECT COUNT(DISTINCT user_id) FROM jobs")
             total_users = (await cur.fetchone())[0]
 
-            # Today's unique users
-            cur = await conn.execute(
-                "SELECT COUNT(DISTINCT user_id) FROM jobs WHERE created_at >= ?",
-                (day_start,),
-            )
+            cur = await conn.execute(active_today, (day_start, today))
             today_users = (await cur.fetchone())[0]
 
             # Video downloads today per user
@@ -187,6 +189,13 @@ class DB:
                 (today,),
             )
             video_users = await cur.fetchall()
+
+            cur = await conn.execute(
+                "SELECT COALESCE(SUM(video_count), 0) FROM daily_limits"
+                " WHERE download_date = ?",
+                (today,),
+            )
+            today_videos = (await cur.fetchone())[0]
 
             # Jobs per user (all time)
             cur = await conn.execute(
@@ -200,6 +209,7 @@ class DB:
                 "today_jobs": today_jobs,
                 "total_users": total_users,
                 "today_users": today_users,
+                "today_videos": int(today_videos or 0),
                 "video_users": [(r[0], r[1]) for r in video_users],
                 "user_jobs": [(r[0], r[1]) for r in user_jobs],
             }
