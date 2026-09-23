@@ -1,7 +1,9 @@
 """Video handlers — YouTube video download and Twitter/X posts."""
 
+import contextlib
 import html as _html
 import logging
+import mimetypes
 import re
 import shutil
 import tempfile
@@ -160,12 +162,190 @@ async def cb_ytdl(c: CallbackQuery, bot: Bot, settings: Settings, db=None) -> No
 
 # ── Twitter / X ──
 
+# Telegram rejects photos over 10 MB and caps bot video uploads at 50 MB.
+# Twitter serves several renditions, so a 1-byte Range probe picks one that fits.
+_TG_PHOTO_LIMIT_MB = 10
+_TWITTER_VIDEO_CAP_MB = 50
+
+_TWEET_URL_RE = re.compile(
+    r"^https?://(?:www\.|mobile\.)?(?:x|twitter)\.com/([A-Za-z0-9_]{1,20})/status/(\d+)",
+    flags=re.IGNORECASE,
+)
+
+
+def _https(u: str) -> str:
+    u = (u or "").strip()
+    return "https://" + u[len("http://"):] if u.startswith("http://") else u
+
+
+def _photo_variants(u: str) -> list[str]:
+    """Preferred-to-fallback photo URLs; `:orig` is full size and can exceed 10 MB."""
+    u = _https(u)
+    if not u:
+        return []
+    if "pbs.twimg.com" not in u:
+        return [u]
+    base = u.split("?")[0]
+    return [f"{base}?name=orig", f"{base}?name=large", f"{base}?name=medium"]
+
+
+def _video_variants(v: dict) -> list[str]:
+    """Direct mp4 renditions, best-first; drops the unusable m3u8 HLS playlist.
+
+    Telegram cannot play an HLS manifest and FxTwitter reports no size for
+    them, so only progressive `mp4` entries qualify. Where a bitrate is known
+    the duration yields an estimated size, which keeps a 4K rendition from
+    being downloaded only to be rejected as too large.
+    """
+    duration = v.get("duration") or 0
+    scored: list[tuple[float, str]] = []
+    for f in v.get("formats") or []:
+        if (f.get("container") or "").lower() != "mp4":
+            continue
+        u = _https(f.get("url") or "")
+        if not u:
+            continue
+        bitrate = f.get("bitrate") or 0
+        est = (bitrate / 8) * duration if bitrate and duration else 0
+        scored.append((est, u))
+    scored.sort(key=lambda s: s[0] or float("inf"), reverse=True)
+
+    urls = [u for _, u in scored]
+    main = _https(v.get("url") or "")
+    if main and main not in urls:
+        urls.append(main)
+    return urls
+
+
+async def _probe_size(url: str) -> int | None:
+    """Size in bytes, read from Content-Range without downloading the body."""
+    if not url:
+        return None
+    try:
+        async with get_session().get(url, headers={"Range": "bytes=0-0"}) as resp:
+            m = re.search(r"/(\d+)\s*$", resp.headers.get("Content-Range") or "")
+            if m:
+                return int(m.group(1))
+            cl = resp.headers.get("Content-Length")
+            if resp.status == 200 and cl and cl.isdigit():
+                return int(cl)
+    except Exception as e:
+        log.info(f"[X] size probe failed: {e}")
+    return None
+
+
+async def _fetch_media(
+    url: str, dest: str, base: str, max_bytes: int = 0
+) -> tuple[str, str, bool]:
+    """Download one remote media URL as (path, content_type, too_big).
+
+    The CDN URL cannot simply be handed to Telegram: the API fetches it
+    server-side and a rejection surfaces as a silent no-op. Pulling the bytes
+    down here turns that into an ordinary, reportable error. `max_bytes` is
+    enforced while streaming, so a rendition whose size could not be probed is
+    still cut off rather than downloaded in full.
+    """
+    path: Path | None = None
+    try:
+        async with get_session().get(url) as resp:
+            if resp.status != 200:
+                log.warning(f"[X] media HTTP {resp.status} for {url[:100]}")
+                return "", "", False
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            ext = (mimetypes.guess_extension(ctype) if ctype else None) or (
+                Path(url.split("?")[0]).suffix or ".bin"
+            )
+            path = Path(dest) / f"{base}{ext}"
+            total = 0
+            with open(path, "wb") as fh:
+                async for chunk in resp.content.iter_chunked(65536):
+                    total += len(chunk)
+                    if max_bytes and total > max_bytes:
+                        log.info(f"[X] {base} exceeded {max_bytes} bytes, skipping")
+                        return "", "", True
+                    fh.write(chunk)
+    except Exception as e:
+        log.warning(f"[X] media download failed: {e}")
+        return "", "", False
+    if path and path.exists() and path.stat().st_size > 0:
+        return str(path), ctype, False
+    return "", "", False
+
+
+async def _pick_video(v: dict, tmp: str) -> tuple[str | None, bool]:
+    """Download the best rendition that fits the upload cap. Returns (path, oversized)."""
+    cap = _TWITTER_VIDEO_CAP_MB * 1024 * 1024
+    oversized = False
+    for i, u in enumerate(_video_variants(v)):
+        size = await _probe_size(u)
+        if size and size > cap:
+            oversized = True
+            continue
+        path, _, too_big = await _fetch_media(u, tmp, f"tweet_video_{i}", max_bytes=cap)
+        if path:
+            return path, False
+        if too_big:
+            oversized = True
+    return None, oversized
+
+
+async def _pick_photo(p: dict, tmp: str, idx: int) -> str | None:
+    """Download a photo at the largest variant that stays under Telegram's cap."""
+    limit = _TG_PHOTO_LIMIT_MB * 1024 * 1024
+    for u in _photo_variants(p.get("url") or ""):
+        size = await _probe_size(u)
+        if size and size > limit:
+            continue
+        path, _, _ = await _fetch_media(u, tmp, f"tweet_photo_{idx}", max_bytes=limit)
+        if path:
+            return path
+    return None
+
+
+async def _report(m: Message, status: Message, text: str) -> None:
+    """Show an error even when the status message has already been removed."""
+    try:
+        await status.edit_text(text, reply_markup=kb_back())
+        return
+    except Exception:
+        pass
+    with contextlib.suppress(Exception):
+        await m.answer(text, reply_markup=kb_back())
+
+
+async def _fetch_tweet(url: str) -> dict:
+    """Resolve an X/Twitter status URL via FxTwitter, newest API shape first."""
+    m2 = _TWEET_URL_RE.match(url.strip())
+    if not m2:
+        return {}
+    status_id = m2.group(2)
+    for api in (
+        f"https://api.fxtwitter.com/2/status/{status_id}",
+        f"https://api.fxtwitter.com/status/{status_id}",
+    ):
+        try:
+            async with get_session().get(api) as resp:
+                if resp.status != 200:
+                    log.info(f"[X] {api} -> HTTP {resp.status}")
+                    continue
+                data = await resp.json()
+        except Exception as e:
+            log.warning(f"[X] fetch failed: {e}")
+            continue
+        # The envelope carries its own code; the API answers HTTP 200 for some
+        # errors, so a 200 alone does not mean the post was found.
+        code = (data or {}).get("code")
+        if code and code != 200:
+            log.info(f"[X] API code {code} for {status_id}: {data.get('message')}")
+            continue
+        tweet = data.get("status") or data.get("tweet") or {}
+        if tweet:
+            return tweet
+    return {}
+
 
 async def process_tweet(m: Message, bot: Bot, url: str, db=None, settings=None) -> None:
     """X/Twitter post: fetch via FxTwitter API, reply with text + media."""
-    from .keyboards import kb_back
-
-    # Check daily video limit for non-admins
     uid = m.from_user.id if m.from_user else 0
     if db and settings and uid not in settings.admin_ids:
         count = await db.get_video_count_today(uid)
@@ -175,89 +355,94 @@ async def process_tweet(m: Message, bot: Bot, url: str, db=None, settings=None) 
 
     status = await m.answer("🐦 در حال خواندن پست از ایکس...", reply_markup=kb_back())
 
-    tweet = None
-    for u in (url, re.sub(r"(?:www\.)?twitter\.com", "x.com", url)):
-        m2 = re.match(
-            r"^https?://(?:www\.|mobile\.)?x\.com/([A-Za-z0-9_]{1,20})/status/(\d+)",
-            u,
-            flags=re.IGNORECASE,
-        )
-        if not m2:
-            continue
-        status_id = m2.group(2)
-        api = f"https://api.fxtwitter.com/status/{status_id}"
-        try:
-            async with get_session().get(api) as resp:
-                if resp.status != 200:
-                    continue
-                data = await resp.json()
-                tweet = (data or {}).get("tweet") or {}
-            if tweet:
-                break
-        except Exception:
-            continue
-
+    tweet = await _fetch_tweet(url)
     if not tweet:
-        await status.edit_text(
+        await _report(
+            m,
+            status,
             "❌ نتونستم این پست ایکس رو بخونم.\nلینک رو چک کن یا دوباره امتحان کن.",
-            reply_markup=kb_back(),
         )
         return
 
     author = ((tweet.get("author") or {}).get("name") or "").strip()
     text = (tweet.get("text") or "").strip()
-    text = _html.escape(text)
-    author = _html.escape(author)
-
+    link = _html.escape(tweet.get("url") or url, quote=True)
     cap_lines = []
     if author:
-        cap_lines.append(f'👤 <a href="{url}">{author}</a>' if author else "")
+        cap_lines.append(f'👤 <a href="{link}">{_html.escape(author)}</a>')
     cap_lines.append("━━━━━━━━━━━━━━")
     if text:
-        cap_lines.append(text)
+        cap_lines.append(_html.escape(text))
     caption = "\n".join(cap_lines)
 
     media = tweet.get("media") or {}
     vids = media.get("videos") or []
     photos = media.get("photos") or []
 
+    tmp = Path(tempfile.gettempdir()) / "tweet" / uuid.uuid4().hex
+    tmp.mkdir(parents=True, exist_ok=True)
     try:
         if vids:
-            v0 = vids[0]
-            vurl = v0.get("url") or ""
-            if vurl:
-                await status.delete()
-                await m.answer_video(
-                    video=vurl,
-                    caption=caption[:1024],
-                    parse_mode="HTML",
-                )
+            path, oversized = await _pick_video(vids[0], str(tmp))
+            if path:
+                try:
+                    await m.answer_video(
+                        video=FSInputFile(path),
+                        caption=caption[:1024],
+                        parse_mode="HTML",
+                    )
+                except Exception as e:
+                    log.warning(f"[X] send video failed: {e}")
+                    await _report(m, status, "❌ ارسال ویدیو ناموفق بود.")
+                    return
                 if db and settings and uid not in settings.admin_ids:
                     await db.increment_video_count(uid)
-                if len(vids) > 1:
-                    for v in vids[1:4]:
-                        vu = v.get("url") or ""
-                        if vu:
-                            await m.answer_video(vu)
-                for ph in photos[:6]:
-                    pu = ph.get("url") or ""
-                    if pu:
-                        await m.answer_photo(pu)
+                for i, v in enumerate(vids[1:4], start=1):
+                    extra, _ = await _pick_video(v, str(tmp))
+                    if extra:
+                        with contextlib.suppress(Exception):
+                            await m.answer_video(video=FSInputFile(extra))
+                await _send_photos(m, photos, str(tmp), caption=None)
+                with contextlib.suppress(Exception):
+                    await status.delete()
                 return
+            if oversized:
+                await _report(m, status, "📦 حجم ویدیو از محدودیت ارسال تلگرام بیشتره.")
+                return
+
         if photos:
-            await status.delete()
-            first = photos[0].get("url") or ""
-            if first:
-                await m.answer_photo(first, caption=caption[:1024], parse_mode="HTML")
-                for ph in photos[1:6]:
-                    pu = ph.get("url") or ""
-                    if pu:
-                        await m.answer_photo(pu)
+            sent = await _send_photos(m, photos, str(tmp), caption=caption)
+            if sent:
+                with contextlib.suppress(Exception):
+                    await status.delete()
                 return
-        # text-only
+
+        # Nothing sendable — post the text on its own.
         await status.edit_text(caption[:4096], parse_mode="HTML", reply_markup=kb_back())
     except Exception as e:
+        log.warning(f"[X] processing failed: {e}")
+        await _report(m, status, f"❌ خطا در ارسال: {e}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def _send_photos(m: Message, photos: list, tmp: str, caption: str | None) -> bool:
+    """Send up to six photos; the caption rides the first one that uploads."""
+    sent = False
+    for i, p in enumerate(photos[:6]):
+        path = await _pick_photo(p, tmp, i)
+        if not path:
+            continue
         try:
-            await status.edit_text(f"❌ خطا در ارسال: {e}", reply_markup=kb_back())
-        except Exception:
-            pass
+            if caption and not sent:
+                await m.answer_photo(
+                    FSInputFile(path), caption=caption[:1024], parse_mode="HTML"
+                )
+            else:
+                await m.answer_photo(FSInputFile(path))
+        except Exception as e:
+            log.warning(f"[X] send photo failed: {e}")
+            continue
+        sent = True
+    return sent
+
