@@ -4,7 +4,6 @@ import asyncio
 import logging
 import os
 import subprocess
-import tempfile
 from pathlib import Path
 
 log = logging.getLogger("music_bot.shazam")

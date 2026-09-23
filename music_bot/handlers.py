@@ -9,7 +9,6 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import aiohttp
 from aiogram import Bot, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -22,6 +21,7 @@ from .downloader import (
     download_direct_file,
     probe_url,
 )
+from .http import get_session
 from .keyboards import (
     help_text,
     kb_after_send,
@@ -42,8 +42,15 @@ from .sources import (
     is_youtube,
     spotify_preview_url,
 )
-from .utils import clean_title, estimate_size_mb, sanitize_filename, to_persian
-from .video import handle_youtube_link, yt_video_pending
+from .state import PendingStore
+from .utils import (
+    format_duration,
+    clean_title,
+    estimate_size_mb,
+    sanitize_filename,
+    to_persian,
+)
+from .video import handle_youtube_link
 
 log = logging.getLogger("music_bot.handlers")
 
@@ -83,7 +90,7 @@ async def _progress_task(bot: Bot, chat_id: int, msg_id: int, prefix: str) -> No
             break
 
 # Pending Instagram URL mapping: short_id -> (url, chat_id, user_id)
-instagram_pending: dict[str, tuple[str, int, int]] = {}
+instagram_pending = PendingStore()
 
 # Track last quality used per job for retry toggle
 last_quality_by_job: dict[int, int] = {}
@@ -204,11 +211,12 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
     @router.callback_query(lambda c: c.data.startswith("ig_music:"))
     async def cb_ig_music(c: CallbackQuery, bot: Bot):
         url_part = c.data.split(":", 1)[1]
-        entry = instagram_pending.pop(url_part, None)
+        entry = instagram_pending.take(url_part, user_id=c.from_user.id)
         if entry is None:
             await c.answer("منقضی شد یا لینک نامعتبر است.", show_alert=True)
             return
-        original_url, chat_id, user_id = entry
+        original_url, chat_id = entry.value, entry.chat_id
+        user_id = entry.user_id
         await c.answer()
         await c.message.edit_text("🎧 در حال استخراج موزیک از اینستاگرام...")
         track = await identify_music_with_shazam(original_url)
@@ -247,7 +255,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         )
         source_label = match.get("source", "نامشخص")
         await c.message.edit_text(
-            f"🎵 {title}\n👤 {artist if artist else 'نامشخص'}\n🔗 {source_label}\n⏱ {to_persian(duration // 60)}:{to_persian(duration % 60).zfill(2)}",
+            f"🎵 {title}\n👤 {artist if artist else 'نامشخص'}\n🔗 {source_label}\n⏱ {format_duration(duration)}",
             reply_markup=kb_quality(
                 job_id,
                 estimate_size_mb(duration, 128),
@@ -260,11 +268,12 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
     @router.callback_query(lambda c: c.data.startswith("ig_video:"))
     async def cb_ig_video(c: CallbackQuery, bot: Bot):
         url_part = c.data.split(":", 1)[1]
-        entry = instagram_pending.pop(url_part, None)
+        entry = instagram_pending.take(url_part, user_id=c.from_user.id)
         if entry is None:
             await c.answer("منقضی شد یا لینک نامعتبر است.", show_alert=True)
             return
-        original_url, chat_id, user_id = entry
+        original_url, chat_id = entry.value, entry.chat_id
+        user_id = entry.user_id
         await c.answer()
         # Check daily video limit for non-admins
         if user_id not in settings.admin_ids:
@@ -277,7 +286,10 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
                 )
                 return
         await c.message.edit_text("🎬 در حال دانلود کلیپ اینستاگرام...")
-        root = Path(tempfile.gettempdir()) / "ig_video" / str(abs(hash(original_url)))
+        # Unique per attempt: hash() is not stable across processes and collides
+        # for the same URL, which would let one user's cleanup delete another's
+        # in-progress download.
+        root = Path(tempfile.gettempdir()) / "ig_video" / uuid.uuid4().hex
         root.mkdir(parents=True, exist_ok=True)
 
         def _work():
@@ -302,31 +314,36 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             files = list(root.glob("video.*"))
             return str(files[0]) if files else None
 
-        import asyncio
-
-        path = await asyncio.to_thread(_work)
-        if not path:
-            await c.message.edit_text(
-                "❌ دانلود کلیپ ناموفق بود.", reply_markup=kb_back()
-            )
-            shutil.rmtree(root, ignore_errors=True)
-            return
-        src = Path(path)
-        size_mb = src.stat().st_size / (1024 * 1024)
-        await c.message.edit_text("⬆️ در حال ارسال...")
         try:
-            await bot.send_video(
-                chat_id=c.message.chat.id,
-                video=FSInputFile(str(src)),
-                caption=f"🎬 کلیپ اینستاگرام\n📦 {round(size_mb, 1)} MB\n🎧 @ASmusic_robot",
-                supports_streaming=True,
-            )
-            if user_id not in settings.admin_ids:
-                await db.increment_video_count(user_id)
-        except Exception as e:
-            await c.message.edit_text(
-                f"❌ ارسال ناموفق: {e}", reply_markup=kb_back()
-            )
+            path = await asyncio.to_thread(_work)
+            if not path:
+                await c.message.edit_text(
+                    "❌ دانلود کلیپ ناموفق بود.", reply_markup=kb_back()
+                )
+                return
+            src = Path(path)
+            size_mb = src.stat().st_size / (1024 * 1024)
+            if size_mb > settings.max_file_mb:
+                await c.message.edit_text(
+                    f"📦 حجم کلیپ {to_persian(round(size_mb))} مگابایت است — "
+                    f"بیشتر از محدودیت {to_persian(settings.max_file_mb)} مگابایتی.",
+                    reply_markup=kb_back(),
+                )
+                return
+            await c.message.edit_text("⬆️ در حال ارسال...")
+            try:
+                await bot.send_video(
+                    chat_id=chat_id,
+                    video=FSInputFile(str(src)),
+                    caption=f"🎬 کلیپ اینستاگرام\n📦 {round(size_mb, 1)} MB\n🎧 @ASmusic_robot",
+                    supports_streaming=True,
+                )
+                if user_id not in settings.admin_ids:
+                    await db.increment_video_count(user_id)
+            except Exception as e:
+                await c.message.edit_text(
+                    f"❌ ارسال ناموفق: {e}", reply_markup=kb_back()
+                )
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
@@ -336,7 +353,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
     async def cb_yt_music(c: CallbackQuery, bot: Bot):
         from .video import cb_yt_music as _cb
 
-        await _cb(c, bot, settings)
+        await _cb(c, bot, settings, db)
 
     # ── YouTube video ──
 
@@ -389,7 +406,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         card = (
             f"🎵 {meta.get('title') or 'music'}\n"
             f"👤 {meta.get('uploader') or 'نامشخص'}\n"
-            f"⏱ {to_persian(duration // 60)}:{to_persian(duration % 60).zfill(2)}"
+            f"⏱ {format_duration(duration)}"
         )
         await status.edit_text(
             card,
@@ -418,35 +435,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             await c.answer("درخواست منقضی شد.", show_alert=True)
             return
         await c.answer()
-        await c.message.edit_text("⬇️ در حال دانلود... ۱۰٪", reply_markup=kb_back())
-        progress = asyncio.create_task(_progress_task(bot, c.message.chat.id, c.message.message_id, "⬇️ در حال دانلود"))
-        path = await _download_and_send(
-            bot=bot,
-            chat_id=c.message.chat.id,
-            job_id=job_id,
-            quality=quality,
-            title=job.get("title") or "music",
-            artist=job.get("artist") or "",
-            source_url=job.get("source_url") or "",
-            download_url=job.get("download_url") or "",
-            source_name=job.get("source_name") or "",
-            settings=settings,
-            db=db,
-        )
-        # Cancel progress updates
-        progress.cancel()
-        try:
-            await progress
-        except asyncio.CancelledError:
-            pass
-        if path:
-            await c.message.edit_text(
-                "✅ ارسال کامل", reply_markup=kb_after_send(job_id)
-            )
-        else:
-            await c.message.edit_text(
-                "❌ خطا در دانلود/ارسال.", reply_markup=kb_back()
-            )
+        await _run_audio_download(c, bot, db, job, job_id, quality, settings)
 
     # ── Retry with different quality ──
 
@@ -465,37 +454,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         last_q = last_quality_by_job.get(job_id, 320)
         new_q = 128 if last_q == 320 else 320
         await c.answer()
-        await c.message.edit_text(
-            "⬇️ در حال دانلود کیفیت دیگر... ۱۰٪", reply_markup=kb_back()
-        )
-        progress = asyncio.create_task(_progress_task(bot, c.message.chat.id, c.message.message_id, "⬇️ در حال دانلود کیفیت دیگر"))
-        path = await _download_and_send(
-            bot=bot,
-            chat_id=c.message.chat.id,
-            job_id=job_id,
-            quality=new_q,
-            title=job.get("title") or "music",
-            artist=job.get("artist") or "",
-            source_url=job.get("source_url") or "",
-            download_url=job.get("download_url") or "",
-            source_name=job.get("source_name") or "",
-            settings=settings,
-            db=db,
-        )
-        # Cancel progress updates
-        progress.cancel()
-        try:
-            await progress
-        except asyncio.CancelledError:
-            pass
-        if path:
-            await c.message.edit_text(
-                "✅ ارسال کامل", reply_markup=kb_after_send(job_id)
-            )
-        else:
-            await c.message.edit_text(
-                "❌ خطا در دانلود/ارسال.", reply_markup=kb_back()
-            )
+        await _run_audio_download(c, bot, db, job, job_id, new_q, settings, retry=True)
 
     # ── Error handler ──
 
@@ -515,14 +474,17 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         uid = m.from_user.id
         txt = m.text.strip()
 
-        # Check if user is in search mode
+        # A pasted link is always a link — even if the user was mid-search.
+        # Otherwise the search prompt swallows the URL and searches for it.
+        is_link = bool(re.match(r"^https?://", txt))
         if uid in pending_search:
             pending_search.discard(uid)
-            await process_search(m, txt, settings, bot)
-            return
+            if not is_link:
+                await process_search(m, txt, settings, bot)
+                return
 
         # Must be a URL
-        if not re.match(r"^https?://", txt):
+        if not is_link:
             await m.answer(
                 "❌ لینک معتبر بفرست یا از دکمه «🔍 جستجوی موزیک» استفاده کن.",
                 reply_markup=kb_main(uid),
@@ -540,10 +502,11 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         # Instagram: ask music or video
         if is_instagram(url):
             short_id = uuid.uuid4().hex[:8]
-            instagram_pending[short_id] = (
+            instagram_pending.put(
+                short_id,
                 url,
-                m.chat.id,
-                m.from_user.id if m.from_user else 0,
+                user_id=uid,
+                chat_id=m.chat.id,
             )
             await m.answer(
                 "آیا موزیک رو استخراج کنم یا کلیپ کامل بفرستم؟",
@@ -584,7 +547,7 @@ async def identify_music_with_shazam(url: str) -> dict[str, Any] | None:
     2. Others: download audio stream, cut segments, Shazam.
     Returns {"title", "artist", "method"} or None.
     """
-    probe_root = Path(tempfile.gettempdir()) / "music_probe" / str(abs(hash(url)))
+    probe_root = Path(tempfile.gettempdir()) / "music_probe" / uuid.uuid4().hex
     probe_root.mkdir(parents=True, exist_ok=True)
 
     # Spotify: try preview MP3 first
@@ -593,12 +556,9 @@ async def identify_music_with_shazam(url: str) -> dict[str, Any] | None:
         if preview:
             preview_path = probe_root / "preview.mp3"
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        preview, timeout=aiohttp.ClientTimeout(total=20)
-                    ) as r:
-                        if r.status == 200:
-                            preview_path.write_bytes(await r.read())
+                async with get_session().get(preview) as r:
+                    if r.status == 200:
+                        preview_path.write_bytes(await r.read())
                 if preview_path.exists() and preview_path.stat().st_size > 10000:
                     from .shazam import recognize_with_shazam
 
@@ -838,7 +798,7 @@ async def process_url_direct(m: Message, bot: Bot, url: str, settings: Settings,
     card = (
         f"🎵 {title}\n"
         f"👤 {artist if artist else 'نامشخص'}\n"
-        f"⏱ {to_persian(duration // 60)}:{to_persian(duration % 60).zfill(2)}"
+        f"⏱ {format_duration(duration)}"
     )
     await status.edit_text(
         card,
@@ -848,6 +808,49 @@ async def process_url_direct(m: Message, bot: Bot, url: str, settings: Settings,
             estimate_size_mb(duration, 320),
         ),
     )
+
+
+async def _run_audio_download(
+    c: CallbackQuery,
+    bot: Bot,
+    db: DB,
+    job: dict[str, Any],
+    job_id: int,
+    quality: int,
+    settings: Settings,
+    retry: bool = False,
+) -> None:
+    """Drive one audio download end to end and report the outcome once."""
+    label = "⬇️ در حال دانلود کیفیت دیگر" if retry else "⬇️ در حال دانلود"
+    await c.message.edit_text(f"{label}... ۱۰٪", reply_markup=kb_back())
+    progress = asyncio.create_task(
+        _progress_task(bot, c.message.chat.id, c.message.message_id, label)
+    )
+    try:
+        path = await _download_and_send(
+            bot=bot,
+            chat_id=c.message.chat.id,
+            job_id=job_id,
+            quality=quality,
+            title=job.get("title") or "music",
+            artist=job.get("artist") or "",
+            source_url=job.get("source_url") or "",
+            download_url=job.get("download_url") or "",
+            source_name=job.get("source_name") or "",
+            settings=settings,
+            db=db,
+        )
+    finally:
+        progress.cancel()
+        try:
+            await progress
+        except asyncio.CancelledError:
+            pass
+
+    if path:
+        await c.message.edit_text("✅ ارسال کامل", reply_markup=kb_after_send(job_id))
+    else:
+        await c.message.edit_text("❌ خطا در دانلود/ارسال.", reply_markup=kb_back())
 
 
 async def _download_and_send(
@@ -863,10 +866,13 @@ async def _download_and_send(
     settings: Settings | None = None,
     db: DB | None = None,
 ) -> str | None:
-    """Download audio and send it to the chat."""
-    from .keyboards import kb_back
+    """Download audio and send it to the chat.
 
-    root = Path(tempfile.gettempdir()) / "music_dl" / str(job_id)
+    Returns the sent file path on success, None on failure. On failure the
+    caller reports it — this function must not send its own error message,
+    otherwise the user sees a duplicate error and a stale progress message.
+    """
+    root = Path(tempfile.gettempdir()) / "music_dl" / uuid.uuid4().hex
     root.mkdir(parents=True, exist_ok=True)
 
     path = None
@@ -891,7 +897,9 @@ async def _download_and_send(
         path = await download_audio(source_url, quality, str(root), settings)
 
     if not path:
-        await bot.send_message(chat_id, "❌ دانلود ناموفق بود.", reply_markup=kb_back())
+        # Caller owns the failure message: sending one here would leave the
+        # user with both this text and the caller's "download failed" edit.
+        shutil.rmtree(root, ignore_errors=True)
         return None
 
     src = Path(path)
@@ -900,9 +908,11 @@ async def _download_and_send(
     # Clean title for filename
     clean_name = title or "music"
     if " - " in clean_name and artist:
-        parts = clean_name.split(" - ", 1)
-        if artist.lower() in parts[0].lower() or parts[1].strip():
-            clean_name = parts[1].strip() if len(parts) > 1 else parts[0].strip()
+        # "Artist - Song" is the common shape for upload titles; when the known
+        # artist leads the string, the song is the trailing half.
+        head, _, tail = clean_name.partition(" - ")
+        if artist.lower() in head.lower() and tail.strip():
+            clean_name = tail.strip()
     clean_name = re.sub(
         r"\s*[\(\[\{][^\)\]\}]*(?:official|video|audio|lyric|lyrics|hd|4k|remix|edit|clip)[^\)\]\}]*[\)\]\}]",
         "",
@@ -931,6 +941,11 @@ async def _download_and_send(
         pass
 
     size_mb = src.stat().st_size / (1024 * 1024)
+    if settings and size_mb > settings.max_file_mb:
+        log.info(f"[DL] File too large: {size_mb:.1f}MB > {settings.max_file_mb}MB")
+        shutil.rmtree(root, ignore_errors=True)
+        return None
+
     caption = f"🎵 {title}"
     if artist:
         caption += f"\n🎤 {artist}"
@@ -947,9 +962,8 @@ async def _download_and_send(
             performer=(artist[:60] if artist else None),
         )
     except Exception as e:
-        await bot.send_message(
-            chat_id, f"❌ ارسال ناموفق: {e}", reply_markup=kb_back()
-        )
+        log.warning(f"[DL] send_audio failed: {e}")
+        shutil.rmtree(root, ignore_errors=True)
         return None
     finally:
         shutil.rmtree(root, ignore_errors=True)

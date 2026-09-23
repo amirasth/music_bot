@@ -5,3 +5,5 @@ python-dotenv>=1.0.0
 yt-dlp>=2024.8.6
 mutagen>=1.47.0
 shazamio>=0.6.0
+avaland>=0.1.0a0
+tzdata>=2024.1

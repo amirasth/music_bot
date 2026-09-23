@@ -36,6 +36,18 @@
 | `ADMIN_IDS` | آیدی عددی تلگرام خود |
 | `DB_PATH` | `/data/music_bot.db` |
 
+متغیرهای اختیاری:
+
+| Variable | Default | توضیح |
+|---|---|---|
+| `MAX_DURATION_MIN` | `15` | حداکثر طول فایل (دقیقه) |
+| `MAX_FILE_MB` | `35` | سقف حجم فایل صوتی |
+| `MAX_VIDEO_MB` | `50` | سقف حجم ویدیو (سقف تلگرام ۵۰ است) |
+| `BOT_TZ` | `Asia/Tehran` | مرز ریست محدودیت روزانه |
+| `YTDL_CONCURRENCY` | `4` | دانلود همزمان yt-dlp |
+| `COOKIES_FILE` | — | مسیر فایل کوکی برای یوتیوب |
+| `YT_PROXY` | — | پراکسی برای یوتیوب |
+
 ### قدم ۴: ساخت Volume
 
 1. در بخش **Volumes** پروژه Railway
@@ -88,6 +100,8 @@ music_bot/
 │   ├── __init__.py
 │   ├── config.py          # تنظیمات
 │   ├── utils.py           # توابع کمکی
+│   ├── http.py            # سشن مشترک aiohttp
+│   ├── state.py           # دکمه‌های در انتظار (با TTL و مالکیت کاربر)
 │   ├── db.py              # دیتابیس SQLite
 │   ├── sources.py         # منابع جستجو
 │   ├── shazam.py          # شناسایی موزیک

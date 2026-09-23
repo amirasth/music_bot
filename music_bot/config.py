@@ -37,7 +37,12 @@ class Settings:
     admin_ids: set[int] = field(default_factory=set)
     max_duration_min: int = 15
     max_file_mb: int = 35
+    # Telegram caps bot uploads at 50 MB; a higher value here only delays the
+    # failure to send time.
+    max_video_mb: int = 50
     db_path: str = "./music_bot.db"
+    bot_tz: str = "Asia/Tehran"
+    ytdl_concurrency: int = 4
     cookies_file: str = ""
     yt_proxy: str = ""
     enable_avaland: bool = True
@@ -56,7 +61,10 @@ def load_settings() -> Settings:
         admin_ids=_parse_admin_ids(os.getenv("ADMIN_IDS", "")),
         max_duration_min=_int_env("MAX_DURATION_MIN", 15),
         max_file_mb=_int_env("MAX_FILE_MB", 35),
+        max_video_mb=_int_env("MAX_VIDEO_MB", 50),
         db_path=os.getenv("DB_PATH", "./music_bot.db").strip(),
+        bot_tz=os.getenv("BOT_TZ", "Asia/Tehran").strip() or "Asia/Tehran",
+        ytdl_concurrency=max(1, _int_env("YTDL_CONCURRENCY", 4)),
         cookies_file=os.getenv("COOKIES_FILE", "").strip(),
         yt_proxy=os.getenv("YT_PROXY", "").strip(),
         enable_avaland=_bool_env("ENABLE_AVALAND", True),

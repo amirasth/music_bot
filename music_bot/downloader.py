@@ -2,16 +2,49 @@
 
 import asyncio
 import logging
+import mimetypes
 from pathlib import Path
 from typing import Any
 
-import aiohttp
-
 from .config import Settings
+from .http import get_session
 
 log = logging.getLogger("music_bot.downloader")
 
-YT_VIDEO_MAX_MB = 60
+# Container extensions yt-dlp may produce, mapped from what a stream hands us.
+_AUDIO_EXT_BY_CONTENT_TYPE = {
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/aac": ".m4a",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/webm": ".webm",
+    "audio/flac": ".flac",
+    "audio/wav": ".wav",
+}
+
+_AUDIO_EXTS = set(_AUDIO_EXT_BY_CONTENT_TYPE.values())
+
+# yt-dlp downloads run in worker threads and each one can hold tens of MB.
+# Unbounded, a burst of users would push a small container into swap; the
+# semaphore bounds concurrent downloads without serializing them.
+_ytdl_semaphore: asyncio.Semaphore | None = None
+
+
+def configure_concurrency(limit: int) -> None:
+    """Set how many yt-dlp downloads may run at once (call once at startup)."""
+    global _ytdl_semaphore
+    _ytdl_semaphore = asyncio.Semaphore(max(1, limit))
+    log.info(f"[DL] yt-dlp concurrency limit: {max(1, limit)}")
+
+
+def _semaphore() -> asyncio.Semaphore:
+    if _ytdl_semaphore is None:
+        configure_concurrency(4)
+    assert _ytdl_semaphore is not None
+    return _ytdl_semaphore
 
 
 def _require_ytdlp():
@@ -96,59 +129,67 @@ async def download_audio(
         candidate = Path(dest) / f"{vid}.mp3"
         return str(candidate) if candidate.exists() else None
 
-    return await asyncio.to_thread(_work)
+    async with _semaphore():
+        return await asyncio.to_thread(_work)
+
+
+def _pick_audio_ext(url: str, content_type: str, base: str) -> str:
+    """Choose a real container extension for a streamed download.
+
+    Hardcoding .mp3 mislabels opus/webm/m4a streams: the file is then sent to
+    Telegram as an MP3 that it is not, and ID3 tagging writes into a container
+    that does not support it. Prefer the response's Content-Type, then the
+    URL's own path, then fall back to mp3.
+    """
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct in _AUDIO_EXT_BY_CONTENT_TYPE:
+        return _AUDIO_EXT_BY_CONTENT_TYPE[ct]
+
+    suffix = Path(url.split("?")[0]).suffix.lower()
+    if suffix in _AUDIO_EXTS:
+        return suffix
+
+    guessed, _ = mimetypes.guess_type(url.split("?")[0])
+    if guessed in _AUDIO_EXT_BY_CONTENT_TYPE:
+        return _AUDIO_EXT_BY_CONTENT_TYPE[guessed]
+
+    if ct and not ct.startswith("audio") and ct != "application/octet-stream":
+        log.info(f"[DL] Unexpected content-type {ct!r} for {base}")
+    return ".mp3"
+
+
+async def _stream_to_file(url: str, dest: str, base: str, log_tag: str) -> str | None:
+    """Fetch a direct media URL into `dest`, naming the file by its real type."""
+    try:
+        async with get_session().get(url) as resp:
+            if resp.status != 200:
+                log.warning(f"[{log_tag}] HTTP {resp.status} for {url[:80]}")
+                return None
+            ext = _pick_audio_ext(url, resp.headers.get("Content-Type", ""), base)
+            dest_path = Path(dest) / f"{base}{ext}"
+            with open(dest_path, "wb") as f:
+                while True:
+                    chunk = await resp.content.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+    except Exception as e:
+        log.warning(f"[{log_tag}] Error: {e}")
+        return None
+
+    if dest_path.exists() and dest_path.stat().st_size > 10000:
+        return str(dest_path)
+    return None
 
 
 async def download_audio_from_stream(stream_url: str, dest: str) -> str | None:
     """Download audio from a direct stream URL (Audius, Piped, Archive)."""
-    dest_path = Path(dest) / "stream_track.mp3"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                stream_url,
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=aiohttp.ClientTimeout(total=120),
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                with open(dest_path, "wb") as f:
-                    while True:
-                        chunk = await resp.content.read(8192)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-        if dest_path.exists() and dest_path.stat().st_size > 10000:
-            return str(dest_path)
-        return None
-    except Exception as e:
-        log.warning(f"[DL_STREAM] Error: {e}")
-        return None
+    return await _stream_to_file(stream_url, dest, "stream_track", "DL_STREAM")
 
 
 async def download_direct_file(url: str, dest: str) -> str | None:
     """Download a direct file URL (e.g. from Avaland) without yt-dlp."""
-    dest_path = Path(dest) / "avaland_track.mp3"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=aiohttp.ClientTimeout(total=120),
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                with open(dest_path, "wb") as f:
-                    while True:
-                        chunk = await resp.content.read(8192)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-        if dest_path.exists() and dest_path.stat().st_size > 10000:
-            return str(dest_path)
-        return None
-    except Exception as e:
-        log.warning(f"[DL_DIRECT] Error: {e}")
-        return None
+    return await _stream_to_file(url, dest, "direct_track", "DL_DIRECT")
 
 
 async def download_youtube_video(
@@ -184,4 +225,5 @@ async def download_youtube_video(
                 return str(f)
         return None
 
-    return await asyncio.to_thread(_work)
+    async with _semaphore():
+        return await asyncio.to_thread(_work)

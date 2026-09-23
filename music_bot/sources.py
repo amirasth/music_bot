@@ -3,11 +3,11 @@
 import asyncio
 import logging
 import re
+import time
 from typing import Any
 
-import aiohttp
-
 from .config import Settings
+from .http import get_session
 from .utils import fuzzy_ratio
 
 log = logging.getLogger("music_bot.sources")
@@ -46,6 +46,9 @@ _SPOTIFY_TRACK_RE = re.compile(
 )
 
 # ── Piped instances ──
+# Sorted by observed reliability: the first few carry almost all traffic, and
+# the search fan-out is capped at PIPED_MAX_ATTEMPTS so one dead host can't
+# stretch a query past its budget.
 PIPED_INSTANCES = [
     "pipedapi.kavin.rocks",
     "pipedapi.adminforge.de",
@@ -53,6 +56,41 @@ PIPED_INSTANCES = [
     "api.piped.private.coffee",
     "pipedapi.drgns.space",
 ]
+
+PIPED_MAX_ATTEMPTS = 3
+
+# Per-source wall-clock budget, enforced inside each source coroutine.
+SEARCH_TIMEOUT_SEC = 12.0
+
+# How long the engine will hold the line for a higher-priority source once a
+# lower-priority answer is already in hand. Priority is a preference, not a
+# guarantee: without this cap a single hung host would make every query as slow
+# as the full SEARCH_TIMEOUT_SEC, even when a good answer was ready in 300ms.
+TIER_WAIT_SEC = 4.0
+
+# Minimum fuzzy score for a candidate to be considered a real match.
+MATCH_THRESHOLD = 0.50
+
+# Identical (title, artist) queries repeat constantly — the same link pasted by
+# many users, retries, the "other quality" button. Cache resolved matches.
+CACHE_TTL_SEC = 600
+_MATCH_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+
+
+def _cancel_all(tasks: list[asyncio.Task]) -> None:
+    """Cancel every unfinished task in the list (idempotent)."""
+    for t in tasks:
+        if not t.done():
+            t.cancel()
+
+
+async def _run_with_timeout(coro, seconds: float, default: Any) -> Any:
+    """Await a source coroutine, returning `default` if it exceeds its budget."""
+    try:
+        return await asyncio.wait_for(coro, timeout=seconds)
+    except (asyncio.TimeoutError, Exception) as e:
+        log.info(f"[SEARCH] Source timed out or failed: {type(e).__name__}")
+        return default
 
 
 # ═══════════════════════════════════════════════════
@@ -125,15 +163,10 @@ async def fetch_spotify_meta(url: str) -> dict[str, str] | None:
         return None
     embed_url = f"https://open.spotify.com/embed/track/{m.group(1)}"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                embed_url,
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                html = await resp.text()
+        async with get_session().get(embed_url) as resp:
+            if resp.status != 200:
+                return None
+            html = await resp.text()
     except Exception:
         return None
 
@@ -154,15 +187,10 @@ async def spotify_preview_url(url: str) -> str | None:
         return None
     embed_url = f"https://open.spotify.com/embed/track/{m.group(1)}"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                embed_url,
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                html = await resp.text()
+        async with get_session().get(embed_url) as resp:
+            if resp.status != 200:
+                return None
+            html = await resp.text()
     except Exception:
         return None
     match = re.search(r'"audioPreview":\s*\{"url":"([^"]+)"', html)
@@ -245,16 +273,12 @@ async def search_avaland(query: str) -> dict[str, Any] | None:
 async def _get_audius_node() -> str | None:
     """Get a working Audius discovery node."""
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://api.audius.co",
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    nodes = data.get("data", [])
-                    if nodes:
-                        return nodes[0]
+        async with get_session().get("https://api.audius.co") as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                nodes = data.get("data", [])
+                if nodes:
+                    return nodes[0]
     except Exception:
         pass
     return "https://discovery-provider.audius.co"
@@ -265,82 +289,28 @@ async def search_audius(query: str, limit: int = 5) -> list[dict[str, Any]]:
     node = await _get_audius_node()
     if not node:
         return []
-
-    async def _work() -> list[dict[str, Any]]:
-        try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{node}/v1/tracks/search"
-                params = {"query": query, "limit": str(limit)}
-                async with session.get(
-                    url,
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    if resp.status != 200:
-                        return []
-                    data = await resp.json()
-                    tracks = data.get("data", [])
-                    results = []
-                    for t in tracks:
-                        track_id = t.get("id", "")
-                        title = t.get("title", "")
-                        user = t.get("user", {})
-                        artist = user.get("name", "")
-                        duration = t.get("duration", 0)
-                        stream_url = f"{node}/v1/tracks/{track_id}/stream"
-                        results.append(
-                            {
-                                "id": track_id,
-                                "title": title,
-                                "artist": artist,
-                                "duration": duration,
-                                "stream_url": stream_url,
-                            }
-                        )
-                    return results
-        except Exception as e:
-            log.warning(f"[AUDIUS] Search error: {e}")
-            return []
-
-    return await _work()
-
-
-async def search_audius_async(query: str, limit: int = 5) -> list[dict[str, Any]]:
-    """Search Audius for tracks (async wrapper)."""
-    node = await _get_audius_node()
-    if not node:
-        return []
     try:
-        async with aiohttp.ClientSession() as session:
-            url = f"{node}/v1/tracks/search"
-            params = {"query": query, "limit": str(limit)}
-            async with session.get(
-                url,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    return []
-                data = await resp.json()
-                tracks = data.get("data", [])
-                results = []
-                for t in tracks:
-                    track_id = t.get("id", "")
-                    title = t.get("title", "")
-                    user = t.get("user", {})
-                    artist = user.get("name", "")
-                    duration = t.get("duration", 0)
-                    stream_url = f"{node}/v1/tracks/{track_id}/stream"
-                    results.append(
-                        {
-                            "id": track_id,
-                            "title": title,
-                            "artist": artist,
-                            "duration": duration,
-                            "stream_url": stream_url,
-                        }
-                    )
-                return results
+        url = f"{node}/v1/tracks/search"
+        params = {"query": query, "limit": str(limit)}
+        async with get_session().get(url, params=params) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            results = []
+            for t in data.get("data", []):
+                track_id = t.get("id", "")
+                if not track_id:
+                    continue
+                results.append(
+                    {
+                        "id": track_id,
+                        "title": t.get("title", ""),
+                        "artist": (t.get("user") or {}).get("name", ""),
+                        "duration": t.get("duration", 0),
+                        "stream_url": f"{node}/v1/tracks/{track_id}/stream",
+                    }
+                )
+            return results
     except Exception as e:
         log.warning(f"[AUDIUS] Search error: {e}")
         return []
@@ -394,92 +364,97 @@ async def search_soundcloud(query: str, limit: int = 5) -> list[dict[str, Any]]:
 # ═══════════════════════════════════════════════════
 
 
+async def _piped_try_instance(instance: str, query: str, limit: int) -> list[dict[str, Any]]:
+    try:
+        url = f"https://{instance}/search"
+        params = {"q": query, "filter": "music_songs"}
+        async with get_session().get(url, params=params) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            results = []
+            for item in (data.get("items") or [])[:limit]:
+                if item.get("type") != "stream":
+                    continue
+                vid = (item.get("url") or "").lstrip("/")
+                title = item.get("title") or ""
+                if not vid or not title:
+                    continue
+                duration = item.get("duration", 0)
+                results.append(
+                    {
+                        "video_id": vid,
+                        "title": title,
+                        "channel": item.get("uploaderName") or "",
+                        "duration": int(duration) if duration else 0,
+                    }
+                )
+            return results
+    except Exception:
+        return []
+
+
 async def search_piped(query: str, limit: int = 5) -> list[dict[str, Any]]:
-    """Search YouTube via Piped API (bypasses datacenter IP blocks)."""
+    """Search YouTube via Piped API (bypasses datacenter IP blocks).
 
-    async def _try_instance(instance: str) -> list[dict[str, Any]]:
-        try:
-            async with aiohttp.ClientSession() as session:
-                url = f"https://{instance}/search"
-                params = {"q": query, "filter": "music_songs"}
-                async with session.get(
-                    url,
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=8),
-                ) as resp:
-                    if resp.status != 200:
-                        return []
-                    data = await resp.json()
-                    items = data.get("items", []) or []
-                    results = []
-                    for item in items[:limit]:
-                        if item.get("type") != "stream":
-                            continue
-                        vid = item.get("url", "").lstrip("/")
-                        title = item.get("title", "")
-                        uploader = item.get("uploaderName", "")
-                        duration = item.get("duration", 0)
-                        if not vid or not title:
-                            continue
-                        results.append(
-                            {
-                                "video_id": vid,
-                                "title": title,
-                                "channel": uploader,
-                                "duration": int(duration) if duration else 0,
-                            }
-                        )
-                    return results
-        except Exception:
-            return []
-
-    # Try first 2 instances in parallel for speed
-    batch1 = await asyncio.gather(
-        _try_instance(PIPED_INSTANCES[0]),
-        _try_instance(PIPED_INSTANCES[1]),
-    )
-    for results in batch1:
-        if results:
-            log.info(f"[PIPED] Got {len(results)} results")
-            return results
-
-    # Fallback: try remaining instances sequentially
-    for instance in PIPED_INSTANCES[2:]:
-        results = await _try_instance(instance)
-        if results:
-            log.info(f"[PIPED] Got {len(results)} results from {instance}")
-            return results
+    Instances are probed in parallel and the first non-empty result wins, so
+    a slow or dead host costs latency only up to PIPED_MAX_ATTEMPTS.
+    """
+    attempts = [
+        asyncio.create_task(_piped_try_instance(inst, query, limit))
+        for inst in PIPED_INSTANCES[:PIPED_MAX_ATTEMPTS]
+    ]
+    try:
+        for coro in asyncio.as_completed(attempts):
+            results = await coro
+            if results:
+                log.info(f"[PIPED] Got {len(results)} results")
+                return results
+    finally:
+        _cancel_all(attempts)
+        await asyncio.gather(*attempts, return_exceptions=True)
     log.info("[PIPED] All instances failed")
     return []
 
 
+async def _piped_stream_try(instance: str, video_id: str) -> str | None:
+    try:
+        url = f"https://{instance}/streams/{video_id}"
+        async with get_session().get(url) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            best, best_br = None, 0
+            for s in data.get("audioStreams") or []:
+                br = s.get("bitrate", 0) or 0
+                if br > best_br:
+                    best_br, best = br, s
+            if best and best.get("url"):
+                log.info(f"[PIPED] Got stream from {instance} ({best_br}bps)")
+                return best["url"]
+    except Exception:
+        return None
+    return None
+
+
 async def piped_stream_url(video_id: str) -> str | None:
-    """Get a direct audio stream URL from Piped for a YouTube video."""
-    for instance in PIPED_INSTANCES:
-        try:
-            async with aiohttp.ClientSession() as session:
-                url = f"https://{instance}/streams/{video_id}"
-                async with session.get(
-                    url,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    if resp.status != 200:
-                        continue
-                    data = await resp.json()
-                    audio_streams = data.get("audioStreams") or []
-                    # Pick the best audio stream by bitrate
-                    best = None
-                    best_br = 0
-                    for s in audio_streams:
-                        br = s.get("bitrate", 0) or 0
-                        if br > best_br:
-                            best_br = br
-                            best = s
-                    if best and best.get("url"):
-                        log.info(f"[PIPED] Got stream from {instance} ({best_br}bps)")
-                        return best["url"]
-        except Exception:
-            continue
+    """Get a direct audio stream URL from Piped for a YouTube video.
+
+    Races the probe across instances — the resolve step is on the critical
+    path of every download, so serial retries here are pure added latency.
+    """
+    attempts = [
+        asyncio.create_task(_piped_stream_try(inst, video_id))
+        for inst in PIPED_INSTANCES[:PIPED_MAX_ATTEMPTS]
+    ]
+    try:
+        for coro in asyncio.as_completed(attempts):
+            url = await coro
+            if url:
+                return url
+    finally:
+        _cancel_all(attempts)
+        await asyncio.gather(*attempts, return_exceptions=True)
     return None
 
 
@@ -549,12 +524,14 @@ async def find_youtube_match(
             best_score = score
             best_match = r
 
-    if best_score >= 0.50:
+    if best_score >= MATCH_THRESHOLD:
         log.info(f"[YT] Best fuzzy match: {best_match['title'][:50]} (score={best_score:.2f})")
         return best_match
 
-    log.info(f"[YT] No strong match (best={best_score:.2f}), accepting first result")
-    return results[0] if results else None
+    # No candidate clears the bar: return nothing rather than the first result,
+    # which would silently download an unrelated song under the wrong title.
+    log.info(f"[YT] No strong match (best={best_score:.2f})")
+    return None
 
 
 # ═══════════════════════════════════════════════════
@@ -565,39 +542,33 @@ async def find_youtube_match(
 async def search_archive(query: str, limit: int = 5) -> list[dict[str, Any]]:
     """Search Archive.org for audio items."""
     try:
-        async with aiohttp.ClientSession() as session:
-            params = {
-                "q": f"({query}) AND mediatype:(audio)",
-                "output": "json",
-                "rows": str(limit),
-                "fl[]": "identifier,title,item_size",
-            }
-            async with session.get(
-                "https://archive.org/advancedsearch.php",
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    return []
-                data = await resp.json()
-                docs = data.get("response", {}).get("docs", [])
-                results = []
-                for doc in docs:
-                    identifier = doc.get("identifier", "")
-                    title = doc.get("title", "")
-                    if not identifier:
-                        continue
-                    direct_url = f"https://archive.org/download/{identifier}/{identifier}.mp3"
-                    results.append(
-                        {
-                            "id": identifier,
-                            "title": title,
-                            "artist": "",
-                            "duration": 0,
-                            "stream_url": direct_url,
-                        }
-                    )
-                return results
+        params = {
+            "q": f"({query}) AND mediatype:(audio)",
+            "output": "json",
+            "rows": str(limit),
+            "fl[]": "identifier,title",
+        }
+        async with get_session().get(
+            "https://archive.org/advancedsearch.php", params=params
+        ) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            results = []
+            for doc in data.get("response", {}).get("docs", []):
+                identifier = doc.get("identifier", "")
+                if not identifier:
+                    continue
+                results.append(
+                    {
+                        "id": identifier,
+                        "title": doc.get("title", ""),
+                        "artist": "",
+                        "duration": 0,
+                        "stream_url": f"https://archive.org/download/{identifier}/{identifier}.mp3",
+                    }
+                )
+            return results
     except Exception as e:
         log.warning(f"[ARCHIVE] Search error: {e}")
         return []
@@ -608,39 +579,6 @@ async def search_archive(query: str, limit: int = 5) -> list[dict[str, Any]]:
 # ═══════════════════════════════════════════════════
 
 
-async def identify_track(url: str) -> dict[str, Any] | None:
-    """Identify the music behind a link via metadata."""
-    from .downloader import probe_url
-
-    if is_spotify(url):
-        return await fetch_spotify_meta(url)
-
-    try:
-        meta = await probe_url(url)
-    except Exception:
-        meta = None
-    if not meta:
-        return None
-
-    title = str(meta.get("title") or "").strip()
-    artist = str(meta.get("uploader") or "").strip()
-
-    # Instagram title parsing
-    if "•" in title:
-        parts = title.split("•", 1)
-        title = parts[1].strip() if len(parts) > 1 else parts[0].strip()
-
-    if " - " in title and not artist:
-        parts = title.split(" - ", 1)
-        title, artist = parts[0].strip(), parts[1].strip()
-
-    title = re.split(r"[|]|\bposted\b|\bon Instagram\b", title)[0].strip(" -·|")
-
-    if not title:
-        return None
-    return {"title": title[:100], "artist": artist[:60]}
-
-
 # ═══════════════════════════════════════════════════
 # Combined: find best match across all sources
 # ═══════════════════════════════════════════════════
@@ -649,154 +587,176 @@ async def identify_track(url: str) -> dict[str, Any] | None:
 async def find_best_match(
     title: str, artist: str, settings: Settings | None = None
 ) -> dict[str, Any] | None:
-    """Search all sources in parallel and return the best match.
+    """Search all sources and return the best match, in priority order.
 
     Priority: Avaland > Audius > SoundCloud > Piped > YouTube > Archive.org
     Returns {"url", "source", "title", "artist", "duration", "download_url"} or None.
     """
     query = f"{artist} {title}".strip() if artist else title
 
+    # ── Cache: resolved-match lookups are the cheapest possible speedup ──
+    cache_key = (title.strip().lower(), artist.strip().lower())
+    now = time.monotonic()
+    cached = _MATCH_CACHE.get(cache_key)
+    if cached and now - cached[0] < CACHE_TTL_SEC:
+        log.info(f"[MATCH] Cache hit for {title[:40]!r}")
+        return cached[1]
+    if len(_MATCH_CACHE) > 500:
+        _MATCH_CACHE.clear()
+
     # ── Search all sources in parallel ──
-    async def _search_avaland():
+    async def _avaland() -> dict[str, Any] | None:
         if settings and not settings.enable_avaland:
             return None
-        try:
-            return await search_avaland(query)
-        except Exception:
-            return None
+        res = await _run_with_timeout(search_avaland(query), SEARCH_TIMEOUT_SEC, None)
+        if res and res.get("url"):
+            log.info(f"[MATCH] Avaland hit: {res.get('title', '')}")
+            return {
+                "url": res["url"],
+                "download_url": res["url"],
+                "source": res.get("source", "Avaland"),
+                "title": res.get("title") or title,
+                "artist": res.get("artist") or artist,
+                "duration": res.get("duration", 0),
+            }
+        return None
 
-    async def _search_audius():
+    async def _audius() -> dict[str, Any] | None:
         if settings and not settings.enable_audius:
-            return []
-        try:
-            return await search_audius_async(query, limit=5)
-        except Exception:
-            return []
-
-    async def _search_soundcloud():
-        try:
-            return await search_soundcloud(query, limit=5)
-        except Exception:
-            return []
-
-    async def _search_piped():
-        if settings and not settings.enable_piped:
-            return []
-        try:
-            return await search_piped(query, limit=5)
-        except Exception:
-            return []
-
-    async def _search_youtube():
-        try:
-            return await find_youtube_match(title, artist, settings=settings)
-        except Exception:
             return None
+        res = await _run_with_timeout(search_audius(query, limit=5), SEARCH_TIMEOUT_SEC, [])
+        for r in res or []:
+            score = _match_score(title, r.get("title", ""))
+            if score >= 0.55 and r.get("stream_url"):
+                log.info(f"[MATCH] Audius hit: {r['title'][:50]} (score={score:.2f})")
+                return {
+                    "url": r["stream_url"],
+                    "download_url": r["stream_url"],
+                    "source": "Audius",
+                    "title": r.get("title") or title,
+                    "artist": r.get("artist") or artist,
+                    "duration": r.get("duration", 0),
+                }
+        return None
 
-    async def _search_archive():
-        if settings and not settings.enable_archive:
-            return []
-        try:
-            return await search_archive(query, limit=3)
-        except Exception:
-            return []
+    async def _soundcloud() -> dict[str, Any] | None:
+        res = await _run_with_timeout(search_soundcloud(query, limit=5), SEARCH_TIMEOUT_SEC, [])
+        for r in res or []:
+            if not r.get("webpage_url"):
+                continue
+            dur = int(r.get("duration") or 0)
+            if 0 < dur < 40:
+                log.info(f"[MATCH] SoundCloud skip preview ({dur}s)")
+                continue
+            score = _match_score(title, r.get("title", ""))
+            if score >= 0.50:
+                log.info(f"[MATCH] SoundCloud hit: {r.get('title', '')[:50]} (score={score:.2f})")
+                return {
+                    "url": r["webpage_url"],
+                    "download_url": "",
+                    "source": "SoundCloud",
+                    "title": r.get("title") or title,
+                    "artist": r.get("uploader") or artist,
+                    "duration": dur,
+                }
+        return None
 
-    avaland_res, audius_res, sc_res, piped_res, yt_res, arch_res = await asyncio.gather(
-        _search_avaland(),
-        _search_audius(),
-        _search_soundcloud(),
-        _search_piped(),
-        _search_youtube(),
-        _search_archive(),
-    )
-
-    # ── 1) Avaland (highest priority) ──
-    if avaland_res and avaland_res.get("url"):
-        log.info(f"[MATCH] Avaland hit: {avaland_res.get('title', '')} from {avaland_res.get('source', '')}")
-        return {
-            "url": avaland_res["url"],
-            "download_url": avaland_res["url"],
-            "source": avaland_res.get("source", "Avaland"),
-            "title": avaland_res.get("title") or title,
-            "artist": avaland_res.get("artist") or artist,
-            "duration": avaland_res.get("duration", 0),
-        }
-
-    # ── 2) Audius ──
-    for r in (audius_res or []):
-        score = _match_score(title, r.get("title", ""))
-        if score >= 0.55:
-            log.info(f"[MATCH] Audius hit: {r['title'][:50]} (score={score:.2f})")
-            return {
-                "url": r.get("stream_url", ""),
-                "download_url": r.get("stream_url", ""),
-                "source": "Audius",
-                "title": r.get("title") or title,
-                "artist": r.get("artist") or artist,
-                "duration": r.get("duration", 0),
-            }
-
-    # ── 3) SoundCloud ──
-    for r in (sc_res or []):
-        if not r.get("webpage_url"):
-            continue
-        dur = int(r.get("duration") or 0)
-        if 0 < dur < 40:
-            log.info(f"[MATCH] SoundCloud skip preview ({dur}s): {r.get('title', '')[:30]}")
-            continue
-        score = _match_score(title, r.get("title", ""))
-        if score >= 0.50:
-            log.info(f"[MATCH] SoundCloud hit: {r.get('title', '')[:50]} (score={score:.2f})")
-            return {
-                "url": r["webpage_url"],
-                "download_url": "",
-                "source": "SoundCloud",
-                "title": r.get("title") or title,
-                "artist": r.get("uploader") or artist,
-                "duration": dur,
-            }
-
-    # ── 4) Piped ──
-    for r in (piped_res or []):
-        score = _match_score(title, r.get("title", ""))
-        if score >= 0.50 and r.get("video_id"):
-            stream_url = await piped_stream_url(r["video_id"])
+    async def _piped() -> dict[str, Any] | None:
+        if settings and not settings.enable_piped:
+            return None
+        res = await _run_with_timeout(search_piped(query, limit=5), SEARCH_TIMEOUT_SEC, [])
+        for r in res or []:
+            vid = r.get("video_id")
+            if not vid:
+                continue
+            score = _match_score(title, r.get("title", ""))
+            if score < 0.50:
+                continue
+            # Resolve inside the task so the candidate is download-ready the
+            # moment this source is considered.
+            stream_url = await _run_with_timeout(
+                piped_stream_url(vid), SEARCH_TIMEOUT_SEC, None
+            )
             if stream_url:
                 log.info(f"[MATCH] Piped hit: {r['title'][:50]} (score={score:.2f})")
                 return {
-                    "url": f"https://www.youtube.com/watch?v={r['video_id']}",
+                    "url": f"https://www.youtube.com/watch?v={vid}",
                     "download_url": stream_url,
                     "source": "Piped",
                     "title": r.get("title") or title,
                     "artist": r.get("channel") or artist,
                     "duration": r.get("duration", 0),
                 }
+        return None
 
-    # ── 5) YouTube ──
-    if yt_res and yt_res.get("video_id"):
-        log.info(f"[MATCH] YouTube hit: {yt_res.get('title', '')[:50]}")
-        return {
-            "url": f"https://www.youtube.com/watch?v={yt_res['video_id']}",
-            "download_url": "",
-            "source": "YouTube",
-            "title": yt_res.get("title") or title,
-            "artist": yt_res.get("channel") or artist,
-            "duration": int(yt_res.get("duration") or 0),
-        }
-
-    # ── 6) Archive.org ──
-    for r in (arch_res or []):
-        score = _match_score(title, r.get("title", ""))
-        if score >= 0.50:
-            log.info(f"[MATCH] Archive hit: {r['title'][:50]} (score={score:.2f})")
+    async def _youtube() -> dict[str, Any] | None:
+        res = await _run_with_timeout(
+            find_youtube_match(title, artist, settings=settings), SEARCH_TIMEOUT_SEC, None
+        )
+        if res and res.get("video_id"):
+            log.info(f"[MATCH] YouTube hit: {res.get('title', '')[:50]}")
             return {
-                "url": r.get("stream_url", ""),
-                "download_url": r.get("stream_url", ""),
-                "source": "Archive.org",
-                "title": r.get("title") or title,
-                "artist": artist,
-                "duration": 0,
+                "url": f"https://www.youtube.com/watch?v={res['video_id']}",
+                "download_url": "",
+                "source": "YouTube",
+                "title": res.get("title") or title,
+                "artist": res.get("channel") or artist,
+                "duration": int(res.get("duration") or 0),
             }
+        return None
+
+    async def _archive() -> dict[str, Any] | None:
+        if settings and not settings.enable_archive:
+            return None
+        res = await _run_with_timeout(search_archive(query, limit=3), SEARCH_TIMEOUT_SEC, [])
+        for r in res or []:
+            score = _match_score(title, r.get("title", ""))
+            if score >= 0.50 and r.get("stream_url"):
+                log.info(f"[MATCH] Archive hit: {r['title'][:50]} (score={score:.2f})")
+                return {
+                    "url": r["stream_url"],
+                    "download_url": r["stream_url"],
+                    "source": "Archive.org",
+                    "title": r.get("title") or title,
+                    "artist": artist,
+                    "duration": 0,
+                }
+        return None
+
+    # Priority tiers. Sources are launched together (so they all make progress
+    # concurrently) but *resolved* tier by tier: the best available answer
+    # returns the instant its tier is ready, without waiting on lower tiers.
+    tiers: list[list[Any]] = [
+        [_avaland],
+        [_audius],
+        [_soundcloud, _piped],
+        [_youtube],
+        [_archive],
+    ]
+
+    tasks: list[asyncio.Task] = []
+    tier_slices: list[list[asyncio.Task]] = []
+    for factories in tiers:
+        group = [asyncio.create_task(fn()) for fn in factories]
+        tier_slices.append(group)
+        tasks.extend(group)
+
+    try:
+        for idx, group in enumerate(tier_slices):
+            done, _pending = await asyncio.wait(group, timeout=TIER_WAIT_SEC)
+            for t in done:
+                if t.cancelled() or t.exception() is not None:
+                    continue
+                candidate = t.result()
+                if candidate:
+                    _MATCH_CACHE[cache_key] = (now, candidate)
+                    return candidate
+            log.info(f"[MATCH] Tier {idx} produced no match within {TIER_WAIT_SEC}s")
+    finally:
+        _cancel_all(tasks)
+        # Await the cancellations so no "Task exception was never retrieved"
+        # noise is emitted for the losing sources.
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     log.info("[MATCH] No match found in any source")
     return None

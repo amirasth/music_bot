@@ -1,11 +1,23 @@
 """SQLite database — job tracking."""
 
 import logging
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 
 log = logging.getLogger("music_bot.db")
+
+
+def _resolve_tz(name: str):
+    """Resolve a timezone name, falling back to UTC when tz data is missing."""
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        log.warning(f"[DB] Timezone {name!r} unavailable, falling back to UTC")
+        return timezone.utc
+
 
 CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -33,10 +45,37 @@ CREATE TABLE IF NOT EXISTS daily_limits (
 )
 """
 
+ALLOWED_UPDATE_FIELDS = frozenset(
+    {
+        "download_url",
+        "source_name",
+        "title",
+        "artist",
+        "duration_sec",
+        "status",
+    }
+)
+
 
 class DB:
-    def __init__(self, path: str):
+    def __init__(self, path: str, tz: str = "Asia/Tehran"):
         self.path = path
+        self.tz = _resolve_tz(tz)
+
+    def _today_local(self) -> str:
+        """Current date in the bot's timezone (daily quota boundary)."""
+        return datetime.now(self.tz).strftime("%Y-%m-%d")
+
+    def _utc_day_start(self) -> str:
+        """UTC instant of local midnight, matching CURRENT_TIMESTAMP format.
+
+        jobs.created_at is written by SQLite in UTC, so 'today' comparisons
+        must be expressed as the UTC instant local midnight corresponds to.
+        """
+        local_midnight = datetime.now(self.tz).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        return local_midnight.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     async def init(self) -> None:
         async with aiosqlite.connect(self.path) as conn:
@@ -60,8 +99,13 @@ class DB:
         parts: list[str] = []
         values: list[Any] = []
         for k, v in fields.items():
+            if k not in ALLOWED_UPDATE_FIELDS:
+                log.warning(f"[DB] Ignoring unknown job column: {k}")
+                continue
             parts.append(f"{k} = ?")
             values.append(v)
+        if not parts:
+            return
         parts.append("updated_at = CURRENT_TIMESTAMP")
         values.append(job_id)
         sql = f"UPDATE jobs SET {', '.join(parts)} WHERE id = ?"
@@ -88,9 +132,7 @@ class DB:
 
     async def get_video_count_today(self, user_id: int) -> int:
         """Get how many videos/clips a user downloaded today."""
-        from datetime import datetime
-
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = self._today_local()
         async with aiosqlite.connect(self.path) as conn:
             cur = await conn.execute(
                 "SELECT video_count FROM daily_limits WHERE user_id = ? AND download_date = ?",
@@ -101,9 +143,7 @@ class DB:
 
     async def increment_video_count(self, user_id: int) -> int:
         """Increment and return today's video count for a user."""
-        from datetime import datetime
-
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = self._today_local()
         async with aiosqlite.connect(self.path) as conn:
             await conn.execute(
                 """INSERT INTO daily_limits (user_id, download_date, video_count)
@@ -117,9 +157,8 @@ class DB:
 
     async def get_stats(self) -> dict[str, Any]:
         """Get bot usage statistics."""
-        from datetime import datetime
-
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = self._today_local()
+        day_start = self._utc_day_start()
         async with aiosqlite.connect(self.path) as conn:
             # Total jobs
             cur = await conn.execute("SELECT COUNT(*) FROM jobs")
@@ -127,7 +166,7 @@ class DB:
 
             # Today's jobs
             cur = await conn.execute(
-                "SELECT COUNT(*) FROM jobs WHERE created_at >= ?", (today,)
+                "SELECT COUNT(*) FROM jobs WHERE created_at >= ?", (day_start,)
             )
             today_jobs = (await cur.fetchone())[0]
 
@@ -137,7 +176,8 @@ class DB:
 
             # Today's unique users
             cur = await conn.execute(
-                "SELECT COUNT(DISTINCT user_id) FROM jobs WHERE created_at >= ?", (today,)
+                "SELECT COUNT(DISTINCT user_id) FROM jobs WHERE created_at >= ?",
+                (day_start,),
             )
             today_users = (await cur.fetchone())[0]
 
@@ -150,7 +190,7 @@ class DB:
 
             # Jobs per user (all time)
             cur = await conn.execute(
-                """SELECT user_id, COUNT(*) as cnt, status
+                """SELECT user_id, COUNT(*) as cnt
                    FROM jobs GROUP BY user_id ORDER BY cnt DESC LIMIT 20"""
             )
             user_jobs = await cur.fetchall()
@@ -161,5 +201,5 @@ class DB:
                 "total_users": total_users,
                 "today_users": today_users,
                 "video_users": [(r[0], r[1]) for r in video_users],
-                "user_jobs": [(r[0], r[1], r[2]) for r in user_jobs],
+                "user_jobs": [(r[0], r[1]) for r in user_jobs],
             }

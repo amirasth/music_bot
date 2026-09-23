@@ -51,11 +51,15 @@ def estimate_size_mb(duration_sec: int, kbps: int) -> str:
     return f"{mb:.1f} MB"
 
 
-def extract_twitter_status_id(url: str) -> str | None:
-    """Extract tweet status ID from a Twitter/X URL."""
-    m = re.match(
-        r"^https?://(?:www\.|mobile\.)?(?:twitter\.com|x\.com)/\w+/status/(\d+)",
-        url,
-        flags=re.IGNORECASE,
-    )
-    return m.group(1) if m else None
+def format_duration(duration_sec: int) -> str:
+    """Format seconds as Persian MM:SS (or HH:MM:SS) with correct zero padding.
+
+    Padding must happen on the ASCII string — padding a Persian-digit string
+    with zfill() would prepend Latin zeros and produce mixed numerals.
+    """
+    total = max(int(duration_sec or 0), 0)
+    hours, rem = divmod(total, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours:
+        return to_persian(f"{hours}:{minutes:02d}:{seconds:02d}")
+    return to_persian(f"{minutes}:{seconds:02d}")
