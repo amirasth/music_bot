@@ -77,7 +77,7 @@ async def probe_url(url: str, settings: Settings | None = None) -> dict[str, Any
         YoutubeDL = _require_ytdlp()
         opts = _base_opts(settings)
         opts["skip_download"] = True
-        opts["extractor_args"] = {"youtube": {"player_client": ["android", "web"]}}
+        opts["extractor_args"] = {"youtube": {"player_client": ["android", "web", "android_vr", "tv_embedded"]}}
         try:
             with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -107,7 +107,7 @@ async def download_audio(
         opts = _base_opts(settings)
         opts["format"] = "bestaudio/best"
         opts["outtmpl"] = outtmpl
-        opts["extractor_args"] = {"youtube": {"player_client": ["android", "web"]}}
+        opts["extractor_args"] = {"youtube": {"player_client": ["android", "web", "android_vr", "tv_embedded"]}}
         opts["postprocessors"] = [
             {
                 "key": "FFmpegExtractAudio",
@@ -201,6 +201,9 @@ async def download_youtube_video(
         YoutubeDL = _require_ytdlp()
         outtmpl = str(Path(dest) / "%(id)s.%(ext)s")
         opts = _base_opts(settings)
+        opts["extractor_args"] = {
+            "youtube": {"player_client": ["android", "web", "android_vr", "tv_embedded"]}
+        }
         opts["format"] = (
             f"bestvideo[height={height}][ext=mp4]+bestaudio[ext=m4a]/"
             f"bestvideo[height={height}]+bestaudio/"

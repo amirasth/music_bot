@@ -102,11 +102,11 @@ def kb_clip_quality(prefix: str, token: str) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📉 کم‌حجم (۴۸۰p)",
+                    text="📉 کیفیت معمولی",
                     callback_data=f"{prefix}:{token}:480",
                 ),
                 InlineKeyboardButton(
-                    text="🎬 اصلی",
+                    text="🎬 کیفیت بالاتر",
                     callback_data=f"{prefix}:{token}:orig",
                 ),
             ],

@@ -24,9 +24,16 @@ def _is_remix(result_title: str) -> bool:
     return bool(_REMIX_WORDS.search(result_title))
 
 
-def _match_score(original_title: str, result_title: str) -> float:
-    """Score a result — base fuzzy ratio penalized if it's a remix."""
+def _match_score(original_title: str, result_title: str, artist: str = "") -> float:
+    """Score a result — base fuzzy ratio penalized if it's a remix.
+
+    The artist is folded in when present: real results are often titled
+    "The Weeknd - Blinding Lights (Official Video)" while the query title is
+    just "Blinding Lights", which sits right on the match threshold.
+    """
     score = fuzzy_ratio(original_title, result_title)
+    if artist:
+        score = max(score, fuzzy_ratio(f"{artist} {original_title}", result_title))
     if _is_remix(result_title):
         score *= 0.5
         log.info(f"[MATCH] Remix penalty applied: {result_title[:40]} → {score:.2f}")
@@ -46,18 +53,17 @@ _SPOTIFY_TRACK_RE = re.compile(
 )
 
 # ── Piped instances ──
-# Sorted by observed reliability: the first few carry almost all traffic, and
-# the search fan-out is capped at PIPED_MAX_ATTEMPTS so one dead host can't
-# stretch a query past its budget.
+# Race every host: dead ones fail fast (502/DNS) and `as_completed` returns
+# the first live answer. The leading instance is the one confirmed to answer
+# music searches from datacenter IPs; its /streams endpoint is bot-blocked
+# upstream, so it feeds the results list while yt-dlp handles the download.
 PIPED_INSTANCES = [
+    "api.piped.private.coffee",
     "pipedapi.kavin.rocks",
     "pipedapi.adminforge.de",
     "pipedapi.reallyaweso.me",
-    "api.piped.private.coffee",
     "pipedapi.drgns.space",
 ]
-
-PIPED_MAX_ATTEMPTS = 3
 
 # Per-source wall-clock budget, enforced inside each source coroutine.
 SEARCH_TIMEOUT_SEC = 12.0
@@ -203,6 +209,39 @@ async def spotify_preview_url(url: str) -> str | None:
     if match:
         return match.group(1).replace("\\u002F", "/")
     return None
+
+
+# ═══════════════════════════════════════════════════
+# SoundCloud metadata (oEmbed)
+# ═══════════════════════════════════════════════════
+
+
+async def soundcloud_meta(url: str) -> dict[str, str] | None:
+    """Title/author of a SoundCloud track via the public oEmbed endpoint.
+
+    Official uploads are DRM'd and yt-dlp refuses them outright, but oEmbed
+    still answers (~0.7s), which turns a dead link into a searchable title.
+    """
+    try:
+        async with get_session().get(
+            "https://soundcloud.com/oembed", params={"format": "json", "url": url}
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+    except Exception as e:
+        log.info(f"[SC] oEmbed failed: {e}")
+        return None
+    title = (data.get("title") or "").strip()
+    artist = (data.get("author_name") or "").strip()
+    # Titles arrive as "Song by Artist" — drop the trailing author so matching
+    # compares the song name itself.
+    suffix = f" by {artist}"
+    if artist and title.lower().endswith(suffix.lower()):
+        title = title[: -len(suffix)].strip()
+    if not title:
+        return None
+    return {"title": title, "artist": artist}
 
 
 # ═══════════════════════════════════════════════════
@@ -414,11 +453,11 @@ async def search_piped(query: str, limit: int = 5) -> list[dict[str, Any]]:
     """Search YouTube via Piped API (bypasses datacenter IP blocks).
 
     Instances are probed in parallel and the first non-empty result wins, so
-    a slow or dead host costs latency only up to PIPED_MAX_ATTEMPTS.
+    a slow or dead host costs latency only up to racing the listed hosts.
     """
     attempts = [
         asyncio.create_task(_piped_try_instance(inst, query, limit))
-        for inst in PIPED_INSTANCES[:PIPED_MAX_ATTEMPTS]
+        for inst in PIPED_INSTANCES
     ]
     try:
         for coro in asyncio.as_completed(attempts):
@@ -461,7 +500,7 @@ async def piped_stream_url(video_id: str) -> str | None:
     """
     attempts = [
         asyncio.create_task(_piped_stream_try(inst, video_id))
-        for inst in PIPED_INSTANCES[:PIPED_MAX_ATTEMPTS]
+        for inst in PIPED_INSTANCES
     ]
     try:
         for coro in asyncio.as_completed(attempts):
@@ -492,8 +531,17 @@ async def search_youtube(query: str, limit: int = 5, settings: Settings | None =
             "noprogress": True,
             "no_warnings": True,
             "skip_download": True,
+            # Flat entries skip the per-video page fetches that trigger the
+            # bot check from datacenter IPs — five results in ~2.4s instead
+            # of a 12s search that ends in a "confirm you're not a bot" wall.
+            "extract_flat": "in_playlist",
+            "ignoreerrors": True,
         }
-        opts["extractor_args"] = {"youtube": {"player_client": ["android", "web"]}}
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["android", "web", "android_vr", "tv_embedded"]
+            }
+        }
         if settings and settings.cookies_file:
             opts["cookiefile"] = settings.cookies_file
         if settings and settings.yt_proxy:
@@ -510,9 +558,10 @@ async def search_youtube(query: str, limit: int = 5, settings: Settings | None =
                 continue
             out.append(
                 {
-                    "video_id": e.get("id"),
+                    # Rich entries expose video_id; flat ones only expose id.
+                    "video_id": e.get("video_id") or e.get("id"),
                     "title": e.get("title") or "بدون عنوان",
-                    "channel": e.get("uploader") or "",
+                    "channel": e.get("channel") or e.get("uploader") or "",
                     "duration": int(e.get("duration") or 0),
                 }
             )
@@ -534,7 +583,7 @@ async def find_youtube_match(
     best_score = 0.0
     for r in results:
         r_title = str(r.get("title", ""))
-        score = _match_score(title, r_title)
+        score = _match_score(title, r_title, artist)
         log.info(f"[YT] Candidate: {r_title[:50]} | fuzzy={score:.2f}")
         if score > best_score:
             best_score = score
@@ -642,7 +691,7 @@ async def find_best_match(
             return None
         res = await _run_with_timeout(search_audius(query, limit=5), SEARCH_TIMEOUT_SEC, [])
         for r in res or []:
-            score = _match_score(title, r.get("title", ""))
+            score = _match_score(title, r.get("title", ""), artist)
             if score >= 0.55 and r.get("stream_url"):
                 log.info(f"[MATCH] Audius hit: {r['title'][:50]} (score={score:.2f})")
                 return {
@@ -664,7 +713,7 @@ async def find_best_match(
             if 0 < dur < 40:
                 log.info(f"[MATCH] SoundCloud skip preview ({dur}s)")
                 continue
-            score = _match_score(title, r.get("title", ""))
+            score = _match_score(title, r.get("title", ""), artist)
             if score >= 0.50:
                 log.info(f"[MATCH] SoundCloud hit: {r.get('title', '')[:50]} (score={score:.2f})")
                 return {
@@ -685,7 +734,7 @@ async def find_best_match(
             vid = r.get("video_id")
             if not vid:
                 continue
-            score = _match_score(title, r.get("title", ""))
+            score = _match_score(title, r.get("title", ""), artist)
             if score < 0.50:
                 continue
             # Resolve inside the task so the candidate is download-ready the
@@ -726,7 +775,7 @@ async def find_best_match(
             return None
         res = await _run_with_timeout(search_archive(query, limit=3), SEARCH_TIMEOUT_SEC, [])
         for r in res or []:
-            score = _match_score(title, r.get("title", ""))
+            score = _match_score(title, r.get("title", ""), artist)
             if score >= 0.50 and r.get("stream_url"):
                 log.info(f"[MATCH] Archive hit: {r['title'][:50]} (score={score:.2f})")
                 return {

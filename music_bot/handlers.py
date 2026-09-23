@@ -41,9 +41,14 @@ from .sources import (
     is_tiktok,
     is_twitter,
     is_youtube,
+    soundcloud_meta,
     spotify_preview_url,
 )
-from .state import PendingStore
+from .state import (
+    PendingStore,
+    cleanup_prev_msg as _cleanup_prev_msg,
+    reply as _reply,
+)
 from .utils import (
     format_duration,
     clean_title,
@@ -55,24 +60,8 @@ from .video import DAILY_VIDEO_LIMIT, handle_youtube_link
 
 log = logging.getLogger("music_bot.handlers")
 
-# ── Progress & message cleanup helpers ──
-
-_last_bot_msg: dict[int, int] = {}
-
-
-async def _cleanup_prev_msg(bot: Bot, chat_id: int) -> None:
-    """Delete the previous bot message in this chat."""
-    prev_id = _last_bot_msg.pop(chat_id, None)
-    if prev_id:
-        try:
-            await bot.delete_message(chat_id, prev_id)
-        except Exception:
-            pass
-
-
-def _track_msg(msg: Message, chat_id: int) -> None:
-    """Track a sent message for future cleanup."""
-    _last_bot_msg[chat_id] = msg.message_id
+# Transient-message cleanup lives in state.py (shared with video.py):
+# _cleanup_prev_msg / _reply are imported from there.
 
 
 async def _progress_task(bot: Bot, chat_id: int, msg_id: int, prefix: str) -> None:
@@ -106,7 +95,8 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
     # ── /start ──
 
     @router.message(CommandStart())
-    async def cmd_start(m: Message):
+    async def cmd_start(m: Message, bot: Bot):
+        await _cleanup_prev_msg(bot, m.chat.id)
         name = m.from_user.first_name if m.from_user else "دوست گرامی"
         txt = (
             f'🎶 <b>سلام {name}!</b>\n'
@@ -121,7 +111,8 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             "\n"
             "🎧 @ASmusic_robot"
         )
-        await m.answer(
+        await _reply(
+            m,
             txt,
             reply_markup=kb_main(m.from_user.id if m.from_user else 0),
             parse_mode="HTML",
@@ -130,8 +121,10 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
     # ── /help ──
 
     @router.message(Command("help"))
-    async def cmd_help(m: Message):
-        await m.answer(
+    async def cmd_help(m: Message, bot: Bot):
+        await _cleanup_prev_msg(bot, m.chat.id)
+        await _reply(
+            m,
             help_text(),
             reply_markup=kb_main(m.from_user.id if m.from_user else 0),
         )
@@ -139,26 +132,28 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
     # ── /jobs (admin only) ──
 
     @router.message(Command("jobs"))
-    async def cmd_jobs(m: Message):
+    async def cmd_jobs(m: Message, bot: Bot):
         if not m.from_user or m.from_user.id not in settings.admin_ids:
             return
+        await _cleanup_prev_msg(bot, m.chat.id)
         rows = await db.list_recent(limit=10)
         if not rows:
-            await m.answer("هنوز هیچ کار ثبت نشده.")
+            await _reply(m, "هنوز هیچ کار ثبت نشده.")
             return
         lines = ["<b>آخرین ۱۰ درخواست:</b>", ""]
         for r in rows:
             lines.append(
                 f"{to_persian(r['id'])} | {r['status']} | {(r['title'] or '')[:30]}"
             )
-        await m.answer("\n".join(lines))
+        await _reply(m, "\n".join(lines))
 
     # ── /info (admin only) ──
 
     @router.message(Command("info"))
-    async def cmd_info(m: Message):
+    async def cmd_info(m: Message, bot: Bot):
         if not m.from_user or m.from_user.id not in settings.admin_ids:
             return
+        await _cleanup_prev_msg(bot, m.chat.id)
         stats = await db.get_stats()
         lines = [
             "📊 <b>وضعیت ربات:</b>",
@@ -170,14 +165,15 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             f"🎬 کلیپ/ویدیو امروز: <b>{to_persian(stats['today_videos'])}</b>",
             f"📥 کل درخواست‌ها: <b>{to_persian(stats['total_jobs'])}</b>",
         ]
-        await m.answer("\n".join(lines), parse_mode="HTML")
+        await _reply(m, "\n".join(lines), parse_mode="HTML")
 
     # ── /stats (admin only) ──
 
     @router.message(Command("stats"))
-    async def cmd_stats(m: Message):
+    async def cmd_stats(m: Message, bot: Bot):
         if not m.from_user or m.from_user.id not in settings.admin_ids:
             return
+        await _cleanup_prev_msg(bot, m.chat.id)
         stats = await db.get_stats()
         lines = [
             "📊 <b>آمار ربات:</b>",
@@ -199,14 +195,14 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             lines.append("🏆 <b>فعال‌ترین کاربران:</b>")
             for uid, cnt in stats["user_jobs"][:10]:
                 lines.append(f"  • <code>{to_persian(uid)}</code> — {to_persian(cnt)} درخواست")
-        await m.answer("\n".join(lines), parse_mode="HTML")
+        await _reply(m, "\n".join(lines), parse_mode="HTML")
 
     # ── Callback: help ──
 
     @router.callback_query(lambda c: c.data == "help")
     async def cb_help(c: CallbackQuery):
         await c.answer()
-        await c.message.answer(help_text(), reply_markup=kb_main(c.from_user.id))
+        await _reply(c.message, help_text(), reply_markup=kb_main(c.from_user.id))
 
     # ── Callback: home ──
 
@@ -227,8 +223,11 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         pending_search.add(c.from_user.id)
         await c.answer()
         await _cleanup_prev_msg(bot, c.message.chat.id)
-        msg = await c.message.answer("🔎 نام آهنگ رو بفرست تا جستجو کنم:", reply_markup=kb_back())
-        _track_msg(msg, c.message.chat.id)
+        await _reply(
+            c.message,
+            "🔎 نام آهنگ رو بفرست تا جستجو کنم:",
+            reply_markup=kb_back(),
+        )
 
     # ── Instagram music ──
 
@@ -386,7 +385,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
                 await c.message.edit_text(
                     f"📦 حجم کلیپ {to_persian(round(size_mb))} مگابایت است — "
                     f"بیشتر از محدودیت {to_persian(settings.max_video_mb)} مگابایتی.\n"
-                    "گزینه کم‌حجم رو امتحان کن.",
+                    "گزینه کیفیت معمولی رو امتحان کن.",
                     reply_markup=kb_back(),
                 )
                 return
@@ -544,9 +543,20 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         uid = m.from_user.id
         txt = m.text.strip()
 
+        # Accept scheme-less links to supported hosts ("soundcloud.com/...").
+        is_link = bool(re.match(r"^https?://", txt))
+        if not is_link:
+            candidate = "https://" + txt.split()[0]
+            if is_supported_url(candidate) or re.match(
+                r"^https?://(?:www\.|m\.)?on\.soundcloud\.com/",
+                candidate,
+                flags=re.IGNORECASE,
+            ):
+                txt = candidate
+                is_link = True
+
         # A pasted link is always a link — even if the user was mid-search.
         # Otherwise the search prompt swallows the URL and searches for it.
-        is_link = bool(re.match(r"^https?://", txt))
         if uid in pending_search:
             pending_search.discard(uid)
             if not is_link:
@@ -555,15 +565,27 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
 
         # Must be a URL
         if not is_link:
-            await m.answer(
+            await _reply(
+                m,
                 "❌ لینک معتبر بفرست یا از دکمه «🔍 جستجوی موزیک» استفاده کن.",
                 reply_markup=kb_main(uid),
             )
             return
 
         url = txt.split()[0]
+
+        # SoundCloud share links (on.soundcloud.com/...) redirect to the real
+        # track URL, which is the form is_soundcloud accepts.
+        if re.match(
+            r"^https?://(?:www\.|m\.)?on\.soundcloud\.com/", url, flags=re.IGNORECASE
+        ):
+            resolved = await _resolve_redirect(url)
+            if resolved:
+                url = resolved
+
         if not is_supported_url(url):
-            await m.answer(
+            await _reply(
+                m,
                 "❌ لینک پشتیبانی نمی‌شود.\n📎 یوتیوب، اینستاگرام، تیک‌تاک، اسپاتیفای، ساندکلاد یا ایکس.",
                 reply_markup=kb_main(uid),
             )
@@ -578,14 +600,20 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
                 user_id=uid,
                 chat_id=m.chat.id,
             )
-            await m.answer(
+            await _reply(
+                m,
                 "آیا موزیک رو استخراج کنم یا کلیپ کامل بفرستم؟",
                 reply_markup=kb_instagram_choice(short_id),
             )
             return
 
-        # TikTok, Spotify, SoundCloud: identify music
-        if is_tiktok(url) or is_spotify(url) or is_soundcloud(url):
+        # SoundCloud: download the link itself, or find it elsewhere if DRM
+        if is_soundcloud(url):
+            await process_soundcloud(m, bot, url, settings, db)
+            return
+
+        # TikTok, Spotify: identify music (Shazam)
+        if is_tiktok(url) or is_spotify(url):
             await process_identify(m, bot, url, settings, db)
             return
 
@@ -687,13 +715,147 @@ async def _download_probe_audio(source_url: str, dest: str) -> str | None:
     return await asyncio.to_thread(_work)
 
 
+async def _resolve_redirect(url: str) -> str | None:
+    """Follow short-link redirects to the final URL (SoundCloud share links)."""
+    try:
+        async with get_session().get(url, allow_redirects=True) as resp:
+            if resp.status == 200:
+                return str(resp.url)
+    except Exception as e:
+        log.info(f"[URL] redirect resolve failed: {e}")
+    return None
+
+
+async def _offer_direct(
+    m: Message, status: Message, meta: dict[str, Any], url: str, settings: Settings, db: DB
+) -> None:
+    """Create a job from probed metadata and show the quality picker."""
+    duration = int(meta.get("duration") or 0)
+    if duration > settings.max_duration_min * 60:
+        await status.edit_text(
+            f"⏱ ویدیو بیش از {to_persian(settings.max_duration_min)} دقیقه است.",
+            reply_markup=kb_back(),
+        )
+        return
+    job_id = await db.create_job(
+        user_id=m.from_user.id, chat_id=m.chat.id, source_url=url
+    )
+    await db.update_job(
+        job_id,
+        title=meta.get("title"),
+        artist=meta.get("uploader"),
+        duration_sec=duration,
+        status="ready",
+    )
+    card = (
+        f"🎵 {meta.get('title') or 'music'}\n"
+        f"👤 {meta.get('uploader') or 'نامشخص'}\n"
+        f"⏱ {format_duration(duration)}"
+    )
+    await status.edit_text(
+        card,
+        reply_markup=kb_quality(
+            job_id,
+            estimate_size_mb(duration, 128),
+            estimate_size_mb(duration, 320),
+        ),
+    )
+
+
+async def _offer_match(
+    m: Message,
+    status: Message,
+    match: dict[str, Any],
+    *,
+    title: str,
+    artist: str,
+    method_note: str,
+    settings: Settings,
+    db: DB,
+) -> None:
+    """Duration check → job → quality card, for a match found via search."""
+    duration = int(match.get("duration") or 0)
+    if not duration and not match.get("source", "").startswith("Avaland"):
+        meta = await probe_url(match["url"], settings)
+        duration = int((meta or {}).get("duration") or 0)
+    if duration > settings.max_duration_min * 60:
+        await status.edit_text(
+            f"⏱ فایل بیش از {to_persian(settings.max_duration_min)} دقیقه است.",
+            reply_markup=kb_back(),
+        )
+        return
+    job_id = await db.create_job(
+        user_id=m.from_user.id, chat_id=m.chat.id, source_url=match["url"]
+    )
+    await db.update_job(
+        job_id,
+        download_url=match.get("download_url", ""),
+        source_name=match.get("source", ""),
+        title=title,
+        artist=artist,
+        duration_sec=duration,
+        status="ready",
+    )
+    source_label = match.get("source", "نامشخص")
+    card = (
+        f"🎵 {title}\n"
+        f"👤 {artist if artist else 'نامشخص'}\n"
+        f"🔗 منبع دانلود: {source_label}\n"
+        f"{method_note}"
+    )
+    await status.edit_text(
+        card,
+        reply_markup=kb_quality(
+            job_id,
+            estimate_size_mb(duration, 128),
+            estimate_size_mb(duration, 320),
+        ),
+    )
+
+
+async def process_soundcloud(m: Message, bot: Bot, url: str, settings: Settings, db: DB) -> None:
+    """SoundCloud track: download it directly, or find it elsewhere if DRM blocks yt-dlp."""
+    status = await _reply(m, "🔍 در حال بررسی لینک ساندکلاد...", reply_markup=kb_back())
+    meta = await probe_url(url, settings)
+    if meta:
+        await _offer_direct(m, status, meta, url, settings, db)
+        return
+    # Official releases are DRM'd: yt-dlp refuses them, but oEmbed still has
+    # the title — use it to find a downloadable copy on another source.
+    await status.edit_text(
+        "🔎 لینک مستقیم در دسترس نیست — دارم تو منابع دیگه میگردم...",
+        reply_markup=kb_back(),
+    )
+    sc = await soundcloud_meta(url)
+    if not sc:
+        await status.edit_text(
+            "😢 نتونستم این لینک ساندکلاد رو باز کنم.\nلینک رو دوباره کپی کن.",
+            reply_markup=kb_back(),
+        )
+        return
+    match = await find_best_match(sc["title"], sc.get("artist", ""), settings)
+    if not match:
+        await status.edit_text(
+            "😢 این موزیک در هیچ منبعی پیدا نشد.", reply_markup=kb_back()
+        )
+        return
+    await _offer_match(
+        m,
+        status,
+        match,
+        title=sc["title"],
+        artist=sc.get("artist", ""),
+        method_note="🔗 پیدا شده از منابع دیگر (لینک DRM)",
+        settings=settings,
+        db=db,
+    )
+
+
 async def process_identify(m: Message, bot: Bot, url: str, settings: Settings, db: DB) -> None:
     """Shazam the music from a link, then find & download it."""
     from .keyboards import kb_back
 
-    status = await m.answer(
-        "🎧 در حال شناسایی موزیک با Shazam...", reply_markup=kb_back()
-    )
+    status = await _reply(m, "🎧 در حال شناسایی موزیک با Shazam...", reply_markup=kb_back())
     track = await identify_music_with_shazam(url)
     if not track:
         await status.edit_text(
@@ -720,57 +882,30 @@ async def process_identify(m: Message, bot: Bot, url: str, settings: Settings, d
         )
         return
 
-    duration = int(match.get("duration") or 0)
-    if not duration and not match.get("source", "").startswith("Avaland"):
-        meta = await probe_url(match["url"], settings)
-        duration = int((meta or {}).get("duration") or 0)
-
-    if duration > settings.max_duration_min * 60:
-        await status.edit_text(
-            f"⏱ فایل بیش از {to_persian(settings.max_duration_min)} دقیقه است.",
-            reply_markup=kb_back(),
-        )
-        return
-
-    job_id = await db.create_job(
-        user_id=m.from_user.id, chat_id=m.chat.id, source_url=match["url"]
-    )
-    await db.update_job(
-        job_id,
-        download_url=match.get("download_url", ""),
-        source_name=match.get("source", ""),
+    await _offer_match(
+        m,
+        status,
+        match,
         title=title,
         artist=artist,
-        duration_sec=duration,
-        status="ready",
-    )
-
-    source_label = match.get("source", "نامشخص")
-    card = (
-        f"🎵 {title}\n"
-        f"👤 {artist if artist else 'نامشخص'}\n"
-        f"🔗 منبع دانلود: {source_label}\n"
-        f"{'🎧 شناسایی با Shazam' if method == 'shazam' else 'ℹ️ شناسایی از اطلاعات لینک'}"
-    )
-    await status.edit_text(
-        card,
-        reply_markup=kb_quality(
-            job_id,
-            estimate_size_mb(duration, 128),
-            estimate_size_mb(duration, 320),
+        method_note=(
+            "🎧 شناسایی با Shazam" if method == "shazam"
+            else "ℹ️ شناسایی از اطلاعات لینک"
         ),
+        settings=settings,
+        db=db,
     )
 
 
 async def process_search(m: Message, query: str, settings: Settings, bot: Bot) -> None:
     """Search YouTube and show results."""
-    from .sources import search_youtube
+    from .sources import SEARCH_TIMEOUT_SEC, _run_with_timeout, search_piped, search_youtube
 
-    status = await m.answer(
+    status = await _reply(
+        m,
         f"🔍 در حال جستجوی «{query}»... ۱۰٪",
         reply_markup=kb_back(),
     )
-    _track_msg(status, m.chat.id)
     progress = asyncio.create_task(_progress_task(bot, m.chat.id, status.message_id, f"🔍 در حال جستجوی «{query}»"))
 
     seen_ids: set[str] = set()
@@ -786,12 +921,27 @@ async def process_search(m: Message, query: str, settings: Settings, bot: Bot) -
     searches = [search_youtube(query, limit=6, settings=settings)]
     if is_likely_artist:
         searches.append(search_youtube(f"{query} popular songs", limit=6, settings=settings))
-    results_list = await asyncio.gather(*searches, return_exceptions=True)
+    # Bound the YouTube fan-out: a degraded network can otherwise hold the
+    # progress message for minutes before the Piped fallback is even tried.
+    results_list = await asyncio.gather(
+        *(_run_with_timeout(s_, SEARCH_TIMEOUT_SEC, []) for s_ in searches),
+        return_exceptions=True,
+    )
 
     for res in results_list:
         if isinstance(res, Exception):
             continue
         for r in res or []:
+            vid = r.get("video_id", "")
+            if vid and vid not in seen_ids:
+                seen_ids.add(vid)
+                all_results.append(r)
+
+    # YouTube bot-checks datacenter IPs outright; Piped's live instance
+    # still answers, in the same result shape the searchdl buttons expect.
+    if not all_results:
+        piped = await search_piped(query, limit=6)
+        for r in piped or []:
             vid = r.get("video_id", "")
             if vid and vid not in seen_ids:
                 seen_ids.add(vid)
@@ -836,48 +986,14 @@ async def process_search(m: Message, query: str, settings: Settings, bot: Bot) -
 
 async def process_url_direct(m: Message, bot: Bot, url: str, settings: Settings, db: DB) -> None:
     """Handle a direct URL — probe, create job, show quality options."""
-    from .keyboards import kb_back
-
-    uid = m.from_user.id
-    status = await m.answer("🔍 در حال بررسی...", reply_markup=kb_back())
+    status = await _reply(m, "🔍 در حال بررسی...", reply_markup=kb_back())
     meta = await probe_url(url, settings)
     if not meta:
         await status.edit_text(
             "😢 اطلاعات ویدیو یافت نشد.", reply_markup=kb_back()
         )
         return
-    duration = int(meta.get("duration") or 0)
-    if duration > settings.max_duration_min * 60:
-        await status.edit_text(
-            f"⏱ ویدیو بیش از {to_persian(settings.max_duration_min)} دقیقه است.",
-            reply_markup=kb_back(),
-        )
-        return
-
-    job_id = await db.create_job(user_id=uid, chat_id=m.chat.id, source_url=url)
-    await db.update_job(
-        job_id,
-        title=meta.get("title"),
-        artist=meta.get("uploader"),
-        duration_sec=duration,
-        status="ready",
-    )
-
-    title = meta.get("title") or "music"
-    artist = meta.get("uploader") or ""
-    card = (
-        f"🎵 {title}\n"
-        f"👤 {artist if artist else 'نامشخص'}\n"
-        f"⏱ {format_duration(duration)}"
-    )
-    await status.edit_text(
-        card,
-        reply_markup=kb_quality(
-            job_id,
-            estimate_size_mb(duration, 128),
-            estimate_size_mb(duration, 320),
-        ),
-    )
+    await _offer_direct(m, status, meta, url, settings, db)
 
 
 async def _run_audio_download(

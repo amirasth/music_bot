@@ -1,4 +1,4 @@
-"""In-memory pending-action stores.
+"""In-memory bot state: pending-action stores and transient message tracking.
 
 Callback data carries an opaque token that maps to the context needed to finish
 an action (the original URL, the chat to reply in). Two things matter here:
@@ -16,6 +16,9 @@ import logging
 import time
 from dataclasses import dataclass
 from typing import Any
+
+from aiogram import Bot
+from aiogram.types import Message
 
 log = logging.getLogger("music_bot.state")
 
@@ -73,3 +76,39 @@ class PendingStore:
         stale = [k for k, e in self._items.items() if now - e.created_at > self.ttl]
         for k in stale:
             self._items.pop(k, None)
+
+
+# ── Transient message tracking (shared by handlers and video) ──
+# Every text message the bot sends as a status/prompt is registered here and
+# deleted on the user's next message or command, so the chat does not fill up
+# with stale prompts. Sent files (audio/photo/video) are never tracked —
+# users keep their downloads.
+
+_transient_msgs: dict[int, list[int]] = {}
+MAX_TRANSIENT = 15
+
+
+async def cleanup_prev_msg(bot: Bot, chat_id: int) -> None:
+    """Delete this chat's tracked transient bot messages."""
+    ids = _transient_msgs.pop(chat_id, [])
+    for msg_id in ids:
+        try:
+            await bot.delete_message(chat_id, msg_id)
+        except Exception:
+            pass
+
+
+def track_msg(msg: Message, chat_id: int) -> None:
+    """Track a transient message for future cleanup."""
+    bucket = _transient_msgs.setdefault(chat_id, [])
+    if msg.message_id not in bucket:
+        bucket.append(msg.message_id)
+    if len(bucket) > MAX_TRANSIENT:
+        del bucket[: len(bucket) - MAX_TRANSIENT]
+
+
+async def reply(m: Message, text: str, **kwargs) -> Message:
+    """Send a transient reply and register it for cleanup on next input."""
+    msg = await m.answer(text, **kwargs)
+    track_msg(msg, m.chat.id)
+    return msg

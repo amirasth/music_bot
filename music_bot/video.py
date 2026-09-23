@@ -17,7 +17,7 @@ from .config import Settings
 from .downloader import download_youtube_video, probe_url
 from .http import get_session
 from .keyboards import kb_back, kb_clip_quality, kb_video_quality, kb_youtube_choice
-from .state import PendingStore
+from .state import PendingStore, reply as _reply
 from .utils import to_persian
 
 log = logging.getLogger("music_bot.video")
@@ -49,7 +49,8 @@ async def handle_youtube_link(m: Message, url: str) -> None:
         user_id=m.from_user.id if m.from_user else 0,
         chat_id=m.chat.id,
     )
-    await m.answer(
+    await _reply(
+        m,
         "این لینک یوتیوبه — موزیک می‌خوای یا خود ویدیو؟",
         reply_markup=kb_youtube_choice(short_id),
     )
@@ -334,7 +335,7 @@ async def _report(m: Message, status: Message, text: str) -> None:
     except Exception:
         pass
     with contextlib.suppress(Exception):
-        await m.answer(text, reply_markup=kb_back())
+        await _reply(m, text, reply_markup=kb_back())
 
 
 async def _fetch_tweet(url: str) -> dict:
@@ -374,7 +375,7 @@ async def process_tweet(m: Message, bot: Bot, url: str, db=None, settings=None) 
     # The daily quota is spent on a clip download, which happens in cb_x_clip
     # after the quality pick — reading a post's text or photos is free.
 
-    status = await m.answer("🐦 در حال خواندن پست از ایکس...", reply_markup=kb_back())
+    status = await _reply(m, "🐦 در حال خواندن پست از ایکس...", reply_markup=kb_back())
 
     tweet = await _fetch_tweet(url)
     if not tweet:
