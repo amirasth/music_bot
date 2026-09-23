@@ -109,16 +109,17 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
     async def cmd_start(m: Message):
         name = m.from_user.first_name if m.from_user else "دوست گرامی"
         txt = (
-            f"🎶 سلام <b>{name}</b>!\n"
-            "آهنگ مورد علاقت رو پیدا کن!\n"
+            f'🎶 <b>سلام {name}!</b>\n'
             "\n"
-            "🎵 دانلود موزیک | 🎬 دانلود کلیپ و ویدیو\n"
-            "📎 یوتیوب، اینستاگرام، تیک‌تاک، اسپاتیفای، ساندکلاد، ایکس\n"
+            "🔗 لینک موزیک یا ویدیوت رو بفرست 🎵\n"
             "\n"
-            "🔗 لینک بفرست یا 🔍 جستجو کن\n"
-            "⚡ کیفیت ۱۲۸ یا ۳۲۰ kbps\n"
+            "🎧 شناسایی آهنگ\n"
+            "🎵 دانلود موزیک\n"
+            "🎬 دانلود کلیپ\n"
             "\n"
-            "🎧 <b>@ASmusic_robot</b>"
+            "📥 YouTube • Instagram • TikTok • Spotify • SoundCloud • X\n"
+            "\n"
+            "🎧 @ASmusic_robot"
         )
         await m.answer(
             txt,

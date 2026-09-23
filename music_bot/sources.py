@@ -66,7 +66,13 @@ SEARCH_TIMEOUT_SEC = 12.0
 # lower-priority answer is already in hand. Priority is a preference, not a
 # guarantee: without this cap a single hung host would make every query as slow
 # as the full SEARCH_TIMEOUT_SEC, even when a good answer was ready in 300ms.
-TIER_WAIT_SEC = 4.0
+#
+# Six seconds, not four: a SoundCloud search costs ~4.5s (fetch the client id,
+# then query), which sat right on the old 4s boundary and made the tier a coin
+# flip — songs plainly present on SoundCloud were reported as not found. A
+# tier whose sources all finish early still returns early, so this only spends
+# the extra time when a source is genuinely slow.
+TIER_WAIT_SEC = 6.0
 
 # Minimum fuzzy score for a candidate to be considered a real match.
 MATCH_THRESHOLD = 0.50
@@ -335,11 +341,21 @@ async def search_soundcloud(query: str, limit: int = 5) -> list[dict[str, Any]]:
             "no_warnings": True,
             "skip_download": True,
             "socket_timeout": 8,
+            # SoundCloud returns DRM-protected tracks that yt-dlp refuses to
+            # extract. Without this, one such entry raises out of the whole
+            # search and a song that is plainly on SoundCloud looks missing.
+            "ignoreerrors": True,
+            # Resolving each search hit individually costs ~20s for five
+            # results, far past the search budget, so the match never landed.
+            # The flat listing carries the same title/uploader/duration data
+            # the matcher needs and comes back in under 4s.
+            "extract_flat": "in_playlist",
         }
         try:
             with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(f"scsearch{limit}:{query}", download=False)
-        except Exception:
+        except Exception as e:
+            log.info(f"[SC] search failed: {e}")
             return []
         out: list[dict[str, Any]] = []
         for e in info.get("entries") or []:
