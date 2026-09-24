@@ -33,6 +33,7 @@ from .errors import (
     VIDEO_TOO_LARGE,
     VIDEO_TOO_LONG,
     code_line,
+    explain,
 )
 from .downloader import (
     download_audio,
@@ -565,6 +566,22 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
     async def on_error(event):
         log.error(f"Handler error: {event.exception}", exc_info=True)
         return True
+
+    # ── Admin: look up an error code ──
+    # Registered before handle_text so a bare code is not answered with
+    # "لینک معتبر بفرست". Admins only: a user pasting a code gets nothing.
+
+    @router.message(lambda m: bool(m.text) and m.text.strip().isdigit() and len(m.text.strip()) == 4)
+    async def cmd_error_code(m: Message, bot: Bot):
+        if not m.from_user or m.from_user.id not in settings.admin_ids:
+            return
+        await _cleanup_prev_msg(bot, m.chat.id)
+        code = m.text.strip()
+        detail = explain(code)
+        if detail is None:
+            await _reply(m, f"کد <code>{code}</code> شناخته نشد.", parse_mode="HTML")
+            return
+        await _reply(m, detail, parse_mode="HTML")
 
     # ── Text message handler ──
 
