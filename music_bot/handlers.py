@@ -188,16 +188,16 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         await _reply(m, "\n".join(lines), parse_mode="HTML")
 
     # ── Stats (admin only) ──
-    # A button on the main menu rather than a typed command: the old /stats is
-    # gone, and a non-admin pressing the button is ignored silently.
+    # A button on the main menu rather than a typed command. The message being
+    # pressed is edited in place, so it is never registered for cleanup — doing
+    # so would delete the very message this writes its answer into.
 
     @router.callback_query(lambda c: c.data == "stats")
-    async def cb_stats(c: CallbackQuery, bot: Bot):
+    async def cb_stats(c: CallbackQuery):
         if not c.from_user or c.from_user.id not in settings.admin_ids:
             await c.answer("دسترسی ندارید.", show_alert=True)
             return
         await c.answer()
-        await _cleanup_prev_msg(bot, c.message.chat.id)
         stats = await db.get_stats()
         lines = [
             "📊 <b>آمار ربات:</b>",
@@ -219,7 +219,11 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             lines.append("🏆 <b>فعال‌ترین کاربران:</b>")
             for uid, cnt in stats["user_jobs"][:10]:
                 lines.append(f"  • <code>{to_persian(uid)}</code> — {to_persian(cnt)} درخواست")
-        await c.message.edit_text("\n".join(lines), parse_mode="HTML")
+        await c.message.edit_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=kb_back(),
+        )
 
     # ── Callback: help ──
 
