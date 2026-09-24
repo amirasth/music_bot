@@ -134,7 +134,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         await _reply(
             m,
             txt,
-            reply_markup=kb_main(),
+            reply_markup=kb_main(bool(m.from_user and m.from_user.id in settings.admin_ids)),
             parse_mode="HTML",
         )
 
@@ -146,7 +146,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         await _reply(
             m,
             help_text(),
-            reply_markup=kb_main(),
+            reply_markup=kb_main(bool(m.from_user and m.from_user.id in settings.admin_ids)),
         )
 
     # ── /jobs (admin only) ──
@@ -187,13 +187,17 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         ]
         await _reply(m, "\n".join(lines), parse_mode="HTML")
 
-    # ── /stats (admin only) ──
+    # ── Stats (admin only) ──
+    # A button on the main menu rather than a typed command: the old /stats is
+    # gone, and a non-admin pressing the button is ignored silently.
 
-    @router.message(Command("stats"))
-    async def cmd_stats(m: Message, bot: Bot):
-        if not m.from_user or m.from_user.id not in settings.admin_ids:
+    @router.callback_query(lambda c: c.data == "stats")
+    async def cb_stats(c: CallbackQuery, bot: Bot):
+        if not c.from_user or c.from_user.id not in settings.admin_ids:
+            await c.answer("دسترسی ندارید.", show_alert=True)
             return
-        await _cleanup_prev_msg(bot, m.chat.id)
+        await c.answer()
+        await _cleanup_prev_msg(bot, c.message.chat.id)
         stats = await db.get_stats()
         lines = [
             "📊 <b>آمار ربات:</b>",
@@ -215,14 +219,18 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             lines.append("🏆 <b>فعال‌ترین کاربران:</b>")
             for uid, cnt in stats["user_jobs"][:10]:
                 lines.append(f"  • <code>{to_persian(uid)}</code> — {to_persian(cnt)} درخواست")
-        await _reply(m, "\n".join(lines), parse_mode="HTML")
+        await c.message.edit_text("\n".join(lines), parse_mode="HTML")
 
     # ── Callback: help ──
 
     @router.callback_query(lambda c: c.data == "help")
     async def cb_help(c: CallbackQuery):
         await c.answer()
-        await _reply(c.message, help_text(), reply_markup=kb_main())
+        await _reply(
+            c.message,
+            help_text(),
+            reply_markup=kb_main(c.from_user.id in settings.admin_ids),
+        )
 
     # ── Callback: home ──
 
@@ -231,7 +239,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         await c.answer()
         await c.message.edit_text(
             "👇 لینک یا نام آهنگ رو بفرست:",
-            reply_markup=kb_main(),
+            reply_markup=kb_main(c.from_user.id in settings.admin_ids),
         )
 
     # ── Callback: search ──
@@ -620,7 +628,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
                 m,
                 "❌ لینک معتبر بفرست یا از دکمه «🔍 جستجوی موزیک» استفاده کن."
                 + code_line(UNSUPPORTED_URL),
-                reply_markup=kb_main(),
+                reply_markup=kb_main(uid in settings.admin_ids),
             )
             return
 
@@ -640,7 +648,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
                 m,
                 "❌ لینک پشتیبانی نمی‌شود.\n📎 یوتیوب، اینستاگرام، تیک‌تاک، اسپاتیفای، ساندکلاد یا ایکس."
                 + code_line(UNSUPPORTED_URL),
-                reply_markup=kb_main(),
+                reply_markup=kb_main(uid in settings.admin_ids),
             )
             return
 
@@ -1023,7 +1031,7 @@ async def process_search(m: Message, query: str, settings: Settings, bot: Bot) -
         log.info(f"[SEARCH] NO_SEARCH_RESULTS no results for {query[:40]!r}")
         await status.edit_text(
             "😢 نتیجه‌ای یافت نشد." + code_line(NO_SEARCH_RESULTS),
-            reply_markup=kb_main(),
+            reply_markup=kb_main(m.from_user.id in settings.admin_ids),
         )
         return
 

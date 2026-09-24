@@ -3,16 +3,19 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-def kb_main() -> InlineKeyboardMarkup:
-    """Main menu: search + help."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🔍 جستجوی موزیک", callback_data="search"),
-                InlineKeyboardButton(text="ℹ️ راهنما", callback_data="help"),
-            ],
-        ]
-    )
+def kb_main(is_admin: bool = False) -> InlineKeyboardMarkup:
+    """Main menu: search + help, plus a stats button for admins."""
+    rows = [
+        [
+            InlineKeyboardButton(text="🔍 جستجوی موزیک", callback_data="search"),
+            InlineKeyboardButton(text="ℹ️ راهنما", callback_data="help"),
+        ],
+    ]
+    if is_admin:
+        rows.append(
+            [InlineKeyboardButton(text="📊 آمار ربات", callback_data="stats")]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def kb_back() -> InlineKeyboardMarkup:
