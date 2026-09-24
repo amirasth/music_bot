@@ -3,7 +3,7 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-def kb_main(uid: int) -> InlineKeyboardMarkup:
+def kb_main() -> InlineKeyboardMarkup:
     """Main menu: search + help."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
