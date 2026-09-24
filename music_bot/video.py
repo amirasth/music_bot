@@ -15,6 +15,7 @@ from aiogram.types import CallbackQuery, FSInputFile, Message
 
 from .config import Settings
 from .downloader import download_youtube_video, probe_url
+from .errors import code_line
 from .http import get_session
 from .keyboards import kb_back, kb_clip_quality, kb_video_quality, kb_youtube_choice
 from .state import PendingStore, reply as _reply
@@ -80,11 +81,19 @@ async def cb_yt_video(c: CallbackQuery, bot: Bot, settings: Settings) -> None:
     url = entry.value
     await c.answer()
     meta = await probe_url(url, settings)
+    if not meta:
+        log.warning(f"[YT_VIDEO] 1001 probe failed for {url[:80]}")
+        await c.message.edit_text(
+            "😢 نتونستم اطلاعات ویدیو رو بخونم." + code_line("1001"),
+            reply_markup=kb_back(),
+        )
+        return
     duration = int((meta or {}).get("duration") or 0)
     if duration and duration > settings.max_duration_min * 60:
         yt_video_pending.take(short_id, user_id=c.from_user.id)
         await c.message.edit_text(
-            f"⏱ ویدیو بیش از {to_persian(settings.max_duration_min)} دقیقه است.",
+            f"⏱ ویدیو بیش از {to_persian(settings.max_duration_min)} دقیقه است."
+            + code_line("3008"),
             reply_markup=kb_back(),
         )
         return
@@ -115,7 +124,9 @@ async def cb_ytdl(c: CallbackQuery, bot: Bot, settings: Settings, db=None) -> No
     if db and uid not in settings.admin_ids:
         count = await db.get_video_count_today(uid)
         if count >= DAILY_VIDEO_LIMIT:
-            await c.message.edit_text(_limit_message(), reply_markup=kb_back())
+            await c.message.edit_text(
+                _limit_message() + code_line("3005"), reply_markup=kb_back()
+            )
             return
     status = await c.message.edit_text(
         f"⬇️ در حال دانلود ویدیو ({to_persian(height)}p)...",
@@ -126,7 +137,10 @@ async def cb_ytdl(c: CallbackQuery, bot: Bot, settings: Settings, db=None) -> No
     try:
         path = await download_youtube_video(url, height, str(root), settings)
         if not path:
-            await status.edit_text("❌ دانلود ناموفق بود.", reply_markup=kb_back())
+            log.warning(f"[YT_VIDEO] 3001 download failed uid={uid} q={height}")
+            await status.edit_text(
+                "❌ دانلود ناموفق بود." + code_line("3001"), reply_markup=kb_back()
+            )
             return
         src_f = Path(path)
         size_mb = src_f.stat().st_size / (1024 * 1024)
@@ -135,10 +149,11 @@ async def cb_ytdl(c: CallbackQuery, bot: Bot, settings: Settings, db=None) -> No
             # original token was consumed, so a fresh one is issued here.
             retry_id = uuid.uuid4().hex[:8]
             yt_video_pending.put(retry_id, url, user_id=uid, chat_id=chat_id)
+            log.info(f"[YT_VIDEO] 3003 oversize uid={uid} size={size_mb:.1f}MB")
             await status.edit_text(
                 f"📦 حجم ویدیو {to_persian(round(size_mb))} مگابایته — "
                 f"بیشتر از محدودیت {to_persian(settings.max_video_mb)} مگ.\n"
-                "کیفیت پایین‌تر رو انتخاب کن.",
+                "کیفیت پایین‌تر رو انتخاب کن." + code_line("3003"),
                 reply_markup=kb_video_quality(retry_id),
             )
             return
@@ -159,8 +174,10 @@ async def cb_ytdl(c: CallbackQuery, bot: Bot, settings: Settings, db=None) -> No
                 await db.increment_video_count(uid)
             await status.delete()
         except Exception as e:
-            log.warning(f"[YT_VIDEO] send_video failed: {e}")
-            await status.edit_text(f"❌ ارسال ناموفق: {e}", reply_markup=kb_back())
+            log.warning(f"[YT_VIDEO] 3004 send_video failed uid={uid}: {e}")
+            await status.edit_text(
+                f"❌ ارسال ناموفق: {e}" + code_line("3004"), reply_markup=kb_back()
+            )
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -379,10 +396,12 @@ async def process_tweet(m: Message, bot: Bot, url: str, db=None, settings=None) 
 
     tweet = await _fetch_tweet(url)
     if not tweet:
+        log.info(f"[X] 4004 fetch failed for {url[:80]}")
         await _report(
             m,
             status,
-            "❌ نتونستم این پست ایکس رو بخونم.\nلینک رو چک کن یا دوباره امتحان کن.",
+            "❌ نتونستم این پست ایکس رو بخونم.\nلینک رو چک کن یا دوباره امتحان کن."
+            + code_line("4004"),
         )
         return
 
@@ -456,7 +475,9 @@ async def cb_x_clip(c: CallbackQuery, bot: Bot, settings: Settings, db=None) -> 
     if db and uid not in settings.admin_ids:
         count = await db.get_video_count_today(uid)
         if count >= DAILY_VIDEO_LIMIT:
-            await c.message.edit_text(_limit_message(), reply_markup=kb_back())
+            await c.message.edit_text(
+                _limit_message() + code_line("3005"), reply_markup=kb_back()
+            )
             return
 
     vids = payload.get("vids") or []
@@ -469,9 +490,11 @@ async def cb_x_clip(c: CallbackQuery, bot: Bot, settings: Settings, db=None) -> 
     try:
         path, oversized = await _pick_video(vids[0], str(tmp), quality)
         if not path:
+            log.info(f"[X] 30{6 if oversized else 7} clip failed uid={uid} q={quality}")
             await c.message.edit_text(
-                "📦 حجم کلیپ از محدودیت ارسال تلگرام بیشتره." if oversized
-                else "❌ دانلود کلیپ ناموفق بود.",
+                ("📦 حجم کلیپ از محدودیت ارسال تلگرام بیشتره." + code_line("3006"))
+                if oversized
+                else ("❌ دانلود کلیپ ناموفق بود." + code_line("3007")),
                 reply_markup=kb_back(),
             )
             return
@@ -486,8 +509,11 @@ async def cb_x_clip(c: CallbackQuery, bot: Bot, settings: Settings, db=None) -> 
                 supports_streaming=True,
             )
         except Exception as e:
-            log.warning(f"[X] send video failed: {e}")
-            await c.message.edit_text("❌ ارسال کلیپ ناموفق بود.", reply_markup=kb_back())
+            log.warning(f"[X] 3004 send video failed uid={uid}: {e}")
+            await c.message.edit_text(
+                "❌ ارسال کلیپ ناموفق بود." + code_line("3004"),
+                reply_markup=kb_back(),
+            )
             return
         if db and uid not in settings.admin_ids:
             await db.increment_video_count(uid)

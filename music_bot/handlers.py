@@ -15,6 +15,7 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Inli
 
 from .config import Settings
 from .db import DB
+from .errors import code_line
 from .downloader import (
     download_audio,
     download_audio_from_stream,
@@ -244,8 +245,10 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         await c.message.edit_text("🎧 در حال استخراج موزیک از اینستاگرام...")
         track = await identify_music_with_shazam(original_url)
         if not track:
+            log.info(f"[IG_MUSIC] 4003 shazam failed for {original_url[:80]}")
             await c.message.edit_text(
-                "😢 نتونستم موزیک رو تشخیص بدم.", reply_markup=kb_back()
+                "😢 نتونستم موزیک رو تشخیص بدم." + code_line("4003"),
+                reply_markup=kb_back(),
             )
             return
         title = track["title"]
@@ -259,8 +262,10 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         )
         match = await find_best_match(title, artist, settings)
         if not match:
+            log.info(f"[IG_MUSIC] 4001 no match for {title[:40]!r}")
             await c.message.edit_text(
-                "😢 این موزیک در هیچ منبعی پیدا نشد.", reply_markup=kb_back()
+                "😢 این موزیک در هیچ منبعی پیدا نشد." + code_line("4001"),
+                reply_markup=kb_back(),
             )
             return
         duration = int(match.get("duration") or 0)
@@ -330,7 +335,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             if count >= DAILY_VIDEO_LIMIT:
                 await c.message.edit_text(
                     "🚫 به محدودیت استفاده روزانه رسیدید (۳ کلیپ/ویدیو در روز).\n"
-                    "⏰ محدودیت ساعت ۱۲ شب ریست میشه.",
+                    "⏰ محدودیت ساعت ۱۲ شب ریست میشه." + code_line("3005"),
                     reply_markup=kb_back(),
                 )
                 return
@@ -375,8 +380,10 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         try:
             path = await asyncio.to_thread(_work)
             if not path:
+                log.warning(f"[IG_VIDEO] 3007 download failed uid={user_id}")
                 await c.message.edit_text(
-                    "❌ دانلود کلیپ ناموفق بود.", reply_markup=kb_back()
+                    "❌ دانلود کلیپ ناموفق بود." + code_line("3007"),
+                    reply_markup=kb_back(),
                 )
                 return
             src = Path(path)
@@ -385,7 +392,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
                 await c.message.edit_text(
                     f"📦 حجم کلیپ {to_persian(round(size_mb))} مگابایت است — "
                     f"بیشتر از محدودیت {to_persian(settings.max_video_mb)} مگابایتی.\n"
-                    "گزینه کیفیت معمولی رو امتحان کن.",
+                    "گزینه کیفیت معمولی رو امتحان کن." + code_line("3003"),
                     reply_markup=kb_back(),
                 )
                 return
@@ -402,8 +409,10 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
                 if user_id not in settings.admin_ids:
                     await db.increment_video_count(user_id)
             except Exception as e:
+                log.warning(f"[IG_VIDEO] 3004 send failed uid={user_id}: {e}")
                 await c.message.edit_text(
-                    f"❌ ارسال ناموفق: {e}", reply_markup=kb_back()
+                    f"❌ ارسال ناموفق: {e}" + code_line("3004"),
+                    reply_markup=kb_back(),
                 )
         finally:
             shutil.rmtree(root, ignore_errors=True)
@@ -453,14 +462,17 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         status = await c.message.edit_text("🔍 در حال بررسی...", reply_markup=kb_back())
         meta = await probe_url(url, settings)
         if not meta:
+            log.warning(f"[SEARCHDL] 1001 probe failed vid={vid}")
             await status.edit_text(
-                "😢 اطلاعات ویدیو یافت نشد.", reply_markup=kb_back()
+                "😢 اطلاعات ویدیو یافت نشد." + code_line("1001"),
+                reply_markup=kb_back(),
             )
             return
         duration = int(meta.get("duration") or 0)
         if duration > settings.max_duration_min * 60:
             await status.edit_text(
-                f"⏱ فایل بیش از {to_persian(settings.max_duration_min)} دقیقه است.",
+                f"⏱ فایل بیش از {to_persian(settings.max_duration_min)} دقیقه است."
+                + code_line("2005"),
                 reply_markup=kb_back(),
             )
             return
@@ -567,7 +579,8 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         if not is_link:
             await _reply(
                 m,
-                "❌ لینک معتبر بفرست یا از دکمه «🔍 جستجوی موزیک» استفاده کن.",
+                "❌ لینک معتبر بفرست یا از دکمه «🔍 جستجوی موزیک» استفاده کن."
+                + code_line("5001"),
                 reply_markup=kb_main(uid),
             )
             return
@@ -586,7 +599,8 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         if not is_supported_url(url):
             await _reply(
                 m,
-                "❌ لینک پشتیبانی نمی‌شود.\n📎 یوتیوب، اینستاگرام، تیک‌تاک، اسپاتیفای، ساندکلاد یا ایکس.",
+                "❌ لینک پشتیبانی نمی‌شود.\n📎 یوتیوب، اینستاگرام، تیک‌تاک، اسپاتیفای، ساندکلاد یا ایکس."
+                + code_line("5001"),
                 reply_markup=kb_main(uid),
             )
             return
@@ -733,7 +747,8 @@ async def _offer_direct(
     duration = int(meta.get("duration") or 0)
     if duration > settings.max_duration_min * 60:
         await status.edit_text(
-            f"⏱ ویدیو بیش از {to_persian(settings.max_duration_min)} دقیقه است.",
+            f"⏱ ویدیو بیش از {to_persian(settings.max_duration_min)} دقیقه است."
+            + code_line("3008"),
             reply_markup=kb_back(),
         )
         return
@@ -780,7 +795,8 @@ async def _offer_match(
         duration = int((meta or {}).get("duration") or 0)
     if duration > settings.max_duration_min * 60:
         await status.edit_text(
-            f"⏱ فایل بیش از {to_persian(settings.max_duration_min)} دقیقه است.",
+            f"⏱ فایل بیش از {to_persian(settings.max_duration_min)} دقیقه است."
+            + code_line("2005"),
             reply_markup=kb_back(),
         )
         return
@@ -828,15 +844,19 @@ async def process_soundcloud(m: Message, bot: Bot, url: str, settings: Settings,
     )
     sc = await soundcloud_meta(url)
     if not sc:
+        log.info(f"[SC] 4004 oEmbed failed for {url[:80]}")
         await status.edit_text(
-            "😢 نتونستم این لینک ساندکلاد رو باز کنم.\nلینک رو دوباره کپی کن.",
+            "😢 نتونستم این لینک ساندکلاد رو باز کنم.\nلینک رو دوباره کپی کن."
+            + code_line("4004"),
             reply_markup=kb_back(),
         )
         return
     match = await find_best_match(sc["title"], sc.get("artist", ""), settings)
     if not match:
+        log.info(f"[SC] 4001 no match for {sc['title'][:40]!r}")
         await status.edit_text(
-            "😢 این موزیک در هیچ منبعی پیدا نشد.", reply_markup=kb_back()
+            "😢 این موزیک در هیچ منبعی پیدا نشد." + code_line("4001"),
+            reply_markup=kb_back(),
         )
         return
     await _offer_match(
@@ -858,9 +878,11 @@ async def process_identify(m: Message, bot: Bot, url: str, settings: Settings, d
     status = await _reply(m, "🎧 در حال شناسایی موزیک با Shazam...", reply_markup=kb_back())
     track = await identify_music_with_shazam(url)
     if not track:
+        log.info(f"[IDENTIFY] 4003 shazam failed for {url[:80]}")
         await status.edit_text(
             "😢 نتونستم موزیک رو تشخیص بدم.\n"
-            "لطفاً لینک مستقیم یوتیوب رو بفرست یا اسم آهنگ رو جستجو کن.",
+            "لطفاً لینک مستقیم یوتیوب رو بفرست یا اسم آهنگ رو جستجو کن."
+            + code_line("4003"),
             reply_markup=kb_back(),
         )
         return
@@ -877,8 +899,10 @@ async def process_identify(m: Message, bot: Bot, url: str, settings: Settings, d
 
     match = await find_best_match(title, artist, settings)
     if not match:
+        log.info(f"[IDENTIFY] 4001 no match for {title[:40]!r}")
         await status.edit_text(
-            "😢 این موزیک در هیچ منبعی پیدا نشد.", reply_markup=kb_back()
+            "😢 این موزیک در هیچ منبعی پیدا نشد." + code_line("4001"),
+            reply_markup=kb_back(),
         )
         return
 
@@ -957,8 +981,10 @@ async def process_search(m: Message, query: str, settings: Settings, bot: Bot) -
         pass
 
     if not all_results:
+        log.info(f"[SEARCH] 4002 no results for {query[:40]!r}")
         await status.edit_text(
-            "😢 نتیجه‌ای یافت نشد.", reply_markup=kb_main(m.from_user.id)
+            "😢 نتیجه‌ای یافت نشد." + code_line("4002"),
+            reply_markup=kb_main(m.from_user.id),
         )
         return
 
@@ -989,8 +1015,10 @@ async def process_url_direct(m: Message, bot: Bot, url: str, settings: Settings,
     status = await _reply(m, "🔍 در حال بررسی...", reply_markup=kb_back())
     meta = await probe_url(url, settings)
     if not meta:
+        log.warning(f"[URL_DIRECT] 1001 probe failed for {url[:80]}")
         await status.edit_text(
-            "😢 اطلاعات ویدیو یافت نشد.", reply_markup=kb_back()
+            "😢 اطلاعات ویدیو یافت نشد." + code_line("1001"),
+            reply_markup=kb_back(),
         )
         return
     await _offer_direct(m, status, meta, url, settings, db)
@@ -1036,7 +1064,14 @@ async def _run_audio_download(
     if path:
         await c.message.edit_text("✅ ارسال کامل", reply_markup=kb_after_send(job_id))
     else:
-        await c.message.edit_text("❌ خطا در دانلود/ارسال.", reply_markup=kb_back())
+        log.warning(
+            f"[DL] 2001 audio download failed job={job_id} q={quality} "
+            f"src={job.get('source_name') or '?'} "
+            f"uid={c.from_user.id if c.from_user else 0}"
+        )
+        await c.message.edit_text(
+            "❌ خطا در دانلود/ارسال." + code_line("2001"), reply_markup=kb_back()
+        )
 
 
 async def _download_and_send(
