@@ -17,6 +17,9 @@ from .config import Settings
 from .db import DB
 from .errors import (
     AUDIO_DOWNLOAD_FAILED,
+    AUDIO_SEND_FAILED,
+    AUDIO_STREAM_FAILED,
+    AUDIO_TOO_LARGE,
     AUDIO_TOO_LONG,
     CLIP_DOWNLOAD_FAILED,
     DAILY_QUOTA_REACHED,
@@ -252,6 +255,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         url_part = c.data.split(":", 1)[1]
         entry = instagram_pending.take(url_part, user_id=c.from_user.id)
         if entry is None:
+            log.info(f"[CB] PENDING_EXPIRED uid={c.from_user.id if c.from_user else 0}")
             await c.answer("منقضی شد یا لینک نامعتبر است.", show_alert=True)
             return
         original_url, chat_id = entry.value, entry.chat_id
@@ -313,6 +317,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         url_part = c.data.split(":", 1)[1]
         entry = instagram_pending.take(url_part, user_id=c.from_user.id)
         if entry is None:
+            log.info(f"[CB] PENDING_EXPIRED uid={c.from_user.id if c.from_user else 0}")
             await c.answer("منقضی شد یا لینک نامعتبر است.", show_alert=True)
             return
         original_url, chat_id = entry.value, entry.chat_id
@@ -339,6 +344,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             return
         entry = ig_clip_pending.take(token, user_id=c.from_user.id)
         if entry is None:
+            log.info(f"[CB] PENDING_EXPIRED uid={c.from_user.id if c.from_user else 0}")
             await c.answer("منقضی شد یا لینک نامعتبر است.", show_alert=True)
             return
         original_url, chat_id = entry.value, entry.chat_id
@@ -527,6 +533,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         job = await db.get_job(job_id)
         if not job:
             log.warning(f"[DL] Job {job_id} not found in database!")
+            log.info(f"[CB] PENDING_EXPIRED job={job_id} uid={c.from_user.id if c.from_user else 0}")
             await c.answer("درخواست منقضی شد.", show_alert=True)
             return
         await c.answer()
@@ -544,6 +551,7 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             return
         job = await db.get_job(job_id)
         if not job:
+            log.info(f"[CB] PENDING_EXPIRED uid={c.from_user.id if c.from_user else 0}")
             await c.answer("منقضی شد.", show_alert=True)
             return
         last_q = last_quality_by_job.get(job_id, 320)
@@ -1055,7 +1063,7 @@ async def _run_audio_download(
         _progress_task(bot, c.message.chat.id, c.message.message_id, label)
     )
     try:
-        path = await _download_and_send(
+        path, err = await _download_and_send(
             bot=bot,
             chat_id=c.message.chat.id,
             job_id=job_id,
@@ -1078,13 +1086,14 @@ async def _run_audio_download(
     if path:
         await c.message.edit_text("✅ ارسال کامل", reply_markup=kb_after_send(job_id))
     else:
+        code = err or AUDIO_DOWNLOAD_FAILED
         log.warning(
-            f"[DL] AUDIO_DOWNLOAD_FAILED audio download failed job={job_id} q={quality} "
+            f"[DL] {code} job={job_id} q={quality} "
             f"src={job.get('source_name') or '?'} "
             f"uid={c.from_user.id if c.from_user else 0}"
         )
         await c.message.edit_text(
-            "❌ خطا در دانلود/ارسال." + code_line(AUDIO_DOWNLOAD_FAILED), reply_markup=kb_back()
+            "❌ خطا در دانلود/ارسال." + code_line(code), reply_markup=kb_back()
         )
 
 
@@ -1100,12 +1109,13 @@ async def _download_and_send(
     source_name: str = "",
     settings: Settings | None = None,
     db: DB | None = None,
-) -> str | None:
+) -> tuple[str | None, str | None]:
     """Download audio and send it to the chat.
 
-    Returns the sent file path on success, None on failure. On failure the
-    caller reports it — this function must not send its own error message,
-    otherwise the user sees a duplicate error and a stale progress message.
+    Returns (path, error_code): the file path on success, or (None, code) where
+    the code says which of the several distinct failures occurred. Reporting is
+    the caller's job — this function must not send its own error message, or the
+    user sees a duplicate error next to the caller's edit.
     """
     root = Path(tempfile.gettempdir()) / "music_dl" / uuid.uuid4().hex
     root.mkdir(parents=True, exist_ok=True)
@@ -1113,6 +1123,7 @@ async def _download_and_send(
     path = None
 
     # Determine download method based on source
+    err: str | None = None
     if download_url:
         # Direct stream URL (Audius, Piped, Avaland, Archive)
         log.info(f"[DL] Direct stream: {download_url[:80]}")
@@ -1120,6 +1131,8 @@ async def _download_and_send(
         if not path:
             # Fallback: try as direct file
             path = await download_direct_file(download_url, str(root))
+        if not path:
+            err = AUDIO_STREAM_FAILED
     elif source_url.startswith("http") and not any(
         h in source_url
         for h in ["youtube.com", "youtu.be", "soundcloud.com", "spotify.com"]
@@ -1127,15 +1140,17 @@ async def _download_and_send(
         # Direct download URL (Avaland)
         log.info(f"[DL] Direct download: {source_url[:80]}")
         path = await download_direct_file(source_url, str(root))
+        if not path:
+            err = AUDIO_STREAM_FAILED
     else:
         # yt-dlp download
-        path = await download_audio(source_url, quality, str(root), settings)
+        path, err = await download_audio(source_url, quality, str(root), settings)
 
     if not path:
         # Caller owns the failure message: sending one here would leave the
         # user with both this text and the caller's "download failed" edit.
         shutil.rmtree(root, ignore_errors=True)
-        return None
+        return None, err or AUDIO_DOWNLOAD_FAILED
 
     src = Path(path)
     ext = src.suffix or ".mp3"
@@ -1177,9 +1192,9 @@ async def _download_and_send(
 
     size_mb = src.stat().st_size / (1024 * 1024)
     if settings and size_mb > settings.max_file_mb:
-        log.info(f"[DL] File too large: {size_mb:.1f}MB > {settings.max_file_mb}MB")
+        log.info(f"[DL] AUDIO_TOO_LARGE {size_mb:.1f}MB > {settings.max_file_mb}MB")
         shutil.rmtree(root, ignore_errors=True)
-        return None
+        return None, AUDIO_TOO_LARGE
 
     caption = f"🎵 {title}"
     if artist:
@@ -1197,13 +1212,13 @@ async def _download_and_send(
             performer=(artist[:60] if artist else None),
         )
     except Exception as e:
-        log.warning(f"[DL] send_audio failed: {e}")
+        log.warning(f"[DL] AUDIO_SEND_FAILED send_audio failed: {e}")
         shutil.rmtree(root, ignore_errors=True)
-        return None
+        return None, AUDIO_SEND_FAILED
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
     if db:
         await db.update_job(job_id, status="sent")
     last_quality_by_job[job_id] = quality
-    return str(src)
+    return str(src), None

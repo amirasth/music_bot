@@ -73,6 +73,7 @@ async def cb_yt_music(c: CallbackQuery, bot: Bot, settings: Settings, db=None) -
     short_id = c.data.split(":", 1)[1]
     entry = yt_video_pending.take(short_id, user_id=c.from_user.id)
     if not entry:
+        log.info(f"[CB] PENDING_EXPIRED uid={c.from_user.id if c.from_user else 0}")
         await c.answer("منقضی شد.", show_alert=True)
         return
     await c.answer()
@@ -87,6 +88,7 @@ async def cb_yt_video(c: CallbackQuery, bot: Bot, settings: Settings) -> None:
     short_id = c.data.split(":", 1)[1]
     entry = yt_video_pending.peek(short_id, user_id=c.from_user.id)
     if not entry:
+        log.info(f"[CB] PENDING_EXPIRED uid={c.from_user.id if c.from_user else 0}")
         await c.answer("منقضی شد.", show_alert=True)
         return
     url = entry.value
@@ -126,6 +128,7 @@ async def cb_ytdl(c: CallbackQuery, bot: Bot, settings: Settings, db=None) -> No
         return
     entry = yt_video_pending.take(short_id, user_id=c.from_user.id)
     if not entry:
+        log.info(f"[CB] PENDING_EXPIRED uid={c.from_user.id if c.from_user else 0}")
         await c.answer("منقضی شد.", show_alert=True)
         return
     url, chat_id = entry.value, entry.chat_id
@@ -146,11 +149,12 @@ async def cb_ytdl(c: CallbackQuery, bot: Bot, settings: Settings, db=None) -> No
     root = Path(tempfile.gettempdir()) / "yt_video" / uuid.uuid4().hex
     root.mkdir(parents=True, exist_ok=True)
     try:
-        path = await download_youtube_video(url, height, str(root), settings)
+        path, err = await download_youtube_video(url, height, str(root), settings)
         if not path:
-            log.warning(f"[YT_VIDEO] VIDEO_DOWNLOAD_FAILED download failed uid={uid} q={height}")
+            code = err or VIDEO_DOWNLOAD_FAILED
+            log.warning(f"[YT_VIDEO] {code} uid={uid} q={height}")
             await status.edit_text(
-                "❌ دانلود ناموفق بود." + code_line(VIDEO_DOWNLOAD_FAILED), reply_markup=kb_back()
+                "❌ دانلود ناموفق بود." + code_line(code), reply_markup=kb_back()
             )
             return
         src_f = Path(path)
@@ -476,6 +480,7 @@ async def cb_x_clip(c: CallbackQuery, bot: Bot, settings: Settings, db=None) -> 
         return
     entry = x_clip_pending.take(token, user_id=c.from_user.id)
     if entry is None:
+        log.info(f"[CB] PENDING_EXPIRED uid={c.from_user.id if c.from_user else 0}")
         await c.answer("منقضی شد یا لینک نامعتبر است.", show_alert=True)
         return
     payload = entry.value

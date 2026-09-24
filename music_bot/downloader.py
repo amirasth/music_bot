@@ -7,6 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
+from .errors import (
+    AUDIO_DOWNLOAD_FAILED,
+    AUDIO_FFMPEG_FAILED,
+    AUDIO_NO_OUTPUT,
+    VIDEO_DOWNLOAD_FAILED,
+    VIDEO_NO_OUTPUT,
+)
 from .http import get_session
 
 log = logging.getLogger("music_bot.downloader")
@@ -98,10 +105,15 @@ async def probe_url(url: str, settings: Settings | None = None) -> dict[str, Any
 
 async def download_audio(
     source_url: str, quality: int, dest: str, settings: Settings | None = None
-) -> str | None:
-    """Download audio from a URL and convert to MP3."""
+) -> tuple[str | None, str | None]:
+    """Download audio from a URL and convert to MP3.
 
-    def _work() -> str | None:
+    Returns (path, error_code). A postprocessing failure is reported apart
+    from a download failure: ffmpeg missing from the image is a deployment
+    problem, not a problem with the track.
+    """
+
+    def _work() -> tuple[str | None, str | None]:
         YoutubeDL = _require_ytdlp()
         outtmpl = str(Path(dest) / "%(id)s.%(ext)s")
         opts = _base_opts(settings)
@@ -119,15 +131,23 @@ async def download_audio(
             with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(source_url, download=True)
         except Exception as e:
-            log.warning(f"[DL_AUDIO] Error: {e}")
-            return None
+            msg = str(e)
+            # ffprobe/ffmpeg missing or a broken postprocessor is an image
+            # problem that will fail every conversion, not this track.
+            if "ffmpeg" in msg.lower() or "ffprobe" in msg.lower() or "Postprocessing" in msg:
+                log.warning(f"[DL_AUDIO] AUDIO_FFMPEG_FAILED Error: {msg[:200]}")
+                return None, AUDIO_FFMPEG_FAILED
+            log.warning(f"[DL_AUDIO] AUDIO_DOWNLOAD_FAILED Error: {msg[:200]}")
+            return None, AUDIO_DOWNLOAD_FAILED
         if not info:
-            return None
+            return None, AUDIO_DOWNLOAD_FAILED
         vid = info.get("id")
         if not vid:
-            return None
+            return None, AUDIO_NO_OUTPUT
         candidate = Path(dest) / f"{vid}.mp3"
-        return str(candidate) if candidate.exists() else None
+        if not candidate.exists():
+            return None, AUDIO_NO_OUTPUT
+        return str(candidate), None
 
     async with _semaphore():
         return await asyncio.to_thread(_work)
@@ -194,10 +214,15 @@ async def download_direct_file(url: str, dest: str) -> str | None:
 
 async def download_youtube_video(
     source_url: str, height: int, dest: str, settings: Settings | None = None
-) -> str | None:
-    """Download YouTube video as mp4 capped at given max height."""
+) -> tuple[str | None, str | None]:
+    """Download YouTube video as mp4 capped at given max height.
 
-    def _work() -> str | None:
+    Returns (path, error_code): the file on success, or (None, code) naming
+    which failure occurred, so the caller can tell a refused download from a
+    run that succeeded but left no playable file.
+    """
+
+    def _work() -> tuple[str | None, str | None]:
         YoutubeDL = _require_ytdlp()
         outtmpl = str(Path(dest) / "%(id)s.%(ext)s")
         opts = _base_opts(settings)
@@ -216,17 +241,19 @@ async def download_youtube_video(
             with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(source_url, download=True)
         except Exception as e:
-            log.warning(f"[DL_VIDEO] Error: {e}")
-            return None
+            log.warning(f"[DL_VIDEO] VIDEO_DOWNLOAD_FAILED Error: {e}")
+            return None, VIDEO_DOWNLOAD_FAILED
         if not info:
-            return None
+            return None, VIDEO_DOWNLOAD_FAILED
         vid = info.get("id")
         if not vid:
-            return None
+            return None, VIDEO_NO_OUTPUT
         for f in sorted(Path(dest).glob(f"{vid}.*")):
             if f.suffix.lower() in {".mp4", ".mkv", ".webm"}:
-                return str(f)
-        return None
+                return str(f), None
+        # yt-dlp reported success but left no playable container behind — a
+        # distinct cause from an outright failure, so it gets its own code.
+        return None, VIDEO_NO_OUTPUT
 
     async with _semaphore():
         return await asyncio.to_thread(_work)
