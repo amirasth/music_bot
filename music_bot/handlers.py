@@ -1087,6 +1087,37 @@ async def process_url_direct(m: Message, bot: Bot, url: str, settings: Settings,
     meta = await probe_url(url, settings)
     if not meta:
         log.warning(f"[URL_DIRECT] PROBE_FAILED probe failed for {url[:80]}")
+        # yt-dlp may be throttled on this host while oEmbed is not; if the
+        # title is readable, look for a downloadable copy elsewhere rather
+        # than dead-ending the user on an error.
+        from .sources import youtube_meta
+
+        yt = await youtube_meta(url)
+        if yt:
+            await status.edit_text(
+                "🔎 لینک یوتیوب در دسترس نبود — دارم نسخه‌ی قابل دانلود رو تو منابع دیگه می‌گردم...",
+                reply_markup=kb_back(),
+            )
+            match = await find_best_match(yt["title"], yt.get("artist", ""), settings)
+            if match:
+                await _offer_match(
+                    m,
+                    status,
+                    match,
+                    title=yt["title"],
+                    artist=yt.get("artist", ""),
+                    method_note="🔗 پیدا شده از منابع دیگر (یوتیوب در دسترس نبود)",
+                    settings=settings,
+                    db=db,
+                )
+                return
+            await status.edit_text(
+                "😢 این موزیک در هیچ منبعی پیدا نشد."
+                + code_line(NO_SOURCE_MATCH)
+                + _search_hint(yt["title"], yt.get("artist", "")),
+                reply_markup=kb_back(),
+            )
+            return
         await status.edit_text(
             "😢 اطلاعات ویدیو یافت نشد." + code_line(PROBE_FAILED),
             reply_markup=kb_back(),

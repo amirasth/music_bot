@@ -216,6 +216,30 @@ async def spotify_preview_url(url: str) -> str | None:
 # ═══════════════════════════════════════════════════
 
 
+async def youtube_meta(url: str) -> dict[str, str] | None:
+    """Title/author of a YouTube video via its public oEmbed endpoint.
+
+    yt-dlp cannot always reach YouTube from a server IP, but oEmbed is served
+    from a separate host that is not throttled — so a link the bot cannot
+    download can still be turned into a searchable title.
+    """
+    try:
+        async with get_session().get(
+            "https://www.youtube.com/oembed", params={"url": url, "format": "json"}
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+    except Exception as e:
+        log.info(f"[YT] oEmbed failed: {e}")
+        return None
+    title = (data.get("title") or "").strip()
+    author = (data.get("author_name") or "").strip()
+    if not title:
+        return None
+    return {"title": title, "artist": author}
+
+
 async def soundcloud_meta(url: str) -> dict[str, str] | None:
     """Title/author of a SoundCloud track via the public oEmbed endpoint.
 
@@ -537,11 +561,10 @@ async def search_youtube(query: str, limit: int = 5, settings: Settings | None =
             "extract_flat": "in_playlist",
             "ignoreerrors": True,
         }
-        opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["android", "web", "android_vr", "tv_embedded"]
-            }
-        }
+        from .downloader import YT_PLAYER_CLIENTS, _js_runtime_opts
+
+        opts["extractor_args"] = {"youtube": {"player_client": YT_PLAYER_CLIENTS}}
+        opts.update(_js_runtime_opts())
         if settings and settings.cookies_file:
             opts["cookiefile"] = settings.cookies_file
         if settings and settings.yt_proxy:
@@ -705,6 +728,8 @@ async def find_best_match(
         return None
 
     async def _soundcloud() -> dict[str, Any] | None:
+        from .downloader import probe_url
+
         res = await _run_with_timeout(search_soundcloud(query, limit=5), SEARCH_TIMEOUT_SEC, [])
         for r in res or []:
             if not r.get("webpage_url"):
@@ -714,16 +739,24 @@ async def find_best_match(
                 log.info(f"[MATCH] SoundCloud skip preview ({dur}s)")
                 continue
             score = _match_score(title, r.get("title", ""), artist)
-            if score >= 0.50:
-                log.info(f"[MATCH] SoundCloud hit: {r.get('title', '')[:50]} (score={score:.2f})")
-                return {
-                    "url": r["webpage_url"],
-                    "download_url": "",
-                    "source": "SoundCloud",
-                    "title": r.get("title") or title,
-                    "artist": r.get("uploader") or artist,
-                    "duration": dur,
-                }
+            if score < 0.50:
+                continue
+            # Official SoundCloud uploads are DRM-protected and yt-dlp refuses
+            # them outright, so offering one guarantees a failed download. Probe
+            # the candidate and fall through to the next result instead; the
+            # probe is cached by yt-dlp and stays inside this tier's budget.
+            if not await _run_with_timeout(probe_url(r["webpage_url"]), 8.0, None):
+                log.info(f"[MATCH] SoundCloud skip unplayable/DRM: {r.get('title','')[:40]}")
+                continue
+            log.info(f"[MATCH] SoundCloud hit: {r.get('title', '')[:50]} (score={score:.2f})")
+            return {
+                "url": r["webpage_url"],
+                "download_url": "",
+                "source": "SoundCloud",
+                "title": r.get("title") or title,
+                "artist": r.get("uploader") or artist,
+                "duration": dur,
+            }
         return None
 
     async def _piped() -> dict[str, Any] | None:

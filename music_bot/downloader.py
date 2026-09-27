@@ -36,6 +36,43 @@ _AUDIO_EXT_BY_CONTENT_TYPE = {
 
 _AUDIO_EXTS = set(_AUDIO_EXT_BY_CONTENT_TYPE.values())
 
+# YouTube player clients, in the order they are tried.
+#
+# Only single-client probes are listed: yt-dlp runs several clients together
+# and a single skipped format inside one of them fails the whole extraction,
+# so a longer list reliably produces *fewer* playable formats, not more.
+# `tv_embedded` was removed from yt-dlp outright, and `android_vr` now demands
+# a GVS PO token, so both are noise here.
+#
+# A 403 on the media fetch is transient (the server-IP throttle), and simply
+# retrying the next client clears it. Trails the plain clients before web.
+YT_PLAYER_CLIENTS: list[str] = ["android", "ios", "tv"]
+
+# Supplying a JavaScript runtime lets yt-dlp solve the signature/n-parameter
+# challenges that gate most adaptive formats. Without one, extraction still
+# "succeeds" but yields a single degraded format that 403s intermittently.
+# The image installs node; point at it when present so yt-dlp does not have to
+# guess from PATH (and so a missing runtime is visible in the log).
+_JS_RUNTIMES = ("node", "deno", "bun", "quickjs")
+
+
+def _js_runtime_opts() -> dict[str, Any]:
+    """Tell yt-dlp which JavaScript runtime to use, if one is installed."""
+    import shutil
+
+    for name in _JS_RUNTIMES:
+        path = shutil.which(name)
+        if path:
+            # yt-dlp wants {runtime: {"path": ...}}; a bare path string is
+            # rejected outright and fails every download with a 2001.
+            return {"js_runtimes": {name: {"path": path}}}
+    log.warning(
+        "[DL] No JavaScript runtime found — YouTube formats may be limited. "
+        "Install node in the image to fix."
+    )
+    return {}
+
+
 # yt-dlp downloads run in worker threads and each one can hold tens of MB.
 # Unbounded, a burst of users would push a small container into swap; the
 # semaphore bounds concurrent downloads without serializing them.
@@ -70,7 +107,13 @@ def _base_opts(settings: Settings | None = None) -> dict[str, Any]:
         "noprogress": True,
         "no_warnings": True,
         "noplaylist": True,
+        # Retry the media fetch itself: a 403 from the server-IP throttle is
+        # intermittent, and yt-dlp's own retries cover it without a new probe.
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_retries": 2,
     }
+    opts.update(_js_runtime_opts())
     if settings:
         if settings.cookies_file:
             opts["cookiefile"] = settings.cookies_file
@@ -86,7 +129,7 @@ async def probe_url(url: str, settings: Settings | None = None) -> dict[str, Any
         YoutubeDL = _require_ytdlp()
         opts = _base_opts(settings)
         opts["skip_download"] = True
-        opts["extractor_args"] = {"youtube": {"player_client": ["android", "web", "android_vr", "tv_embedded"]}}
+        opts["extractor_args"] = {"youtube": {"player_client": YT_PLAYER_CLIENTS}}
         try:
             with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -106,11 +149,25 @@ async def probe_url(url: str, settings: Settings | None = None) -> dict[str, Any
 
 
 def _is_bot_check(msg: str) -> bool:
-    """True when the source is asking the server IP to prove it is not a bot."""
+    """True when the source is asking the server IP to prove it is not a bot.
+
+    Matched against the source's own wording rather than a bare "429": track
+    ids and byte counts are part of the message too, and a two-digit substring
+    like "429" occurs inside them by chance (SoundCloud track 163684297 is a
+    real example), which mislabelled DRM failures as bot checks.
+    """
     m = msg.lower()
     return any(
         p in m
-        for p in ("sign in to confirm", "not a bot", "bot check", "too many requests", "429")
+        for p in (
+            "sign in to confirm",
+            "not a bot",
+            "bot check",
+            "confirm you're not a bot",
+            "too many requests",
+            "http error 429",
+            "429 too many requests",
+        )
     )
 
 
@@ -149,6 +206,18 @@ async def soundcloud_direct_url(source_url: str) -> str | None:
     return await asyncio.to_thread(_work)
 
 
+def _classify_download_error(msg: str) -> str:
+    """Map a yt-dlp download error onto its error code."""
+    if _is_bot_check(msg):
+        return AUDIO_BOT_CHECK
+    # ffprobe/ffmpeg missing or a broken postprocessor is an image problem
+    # that will fail every conversion, not this track.
+    low = msg.lower()
+    if "ffmpeg" in low or "ffprobe" in low or "postprocessing" in low:
+        return AUDIO_FFMPEG_FAILED
+    return AUDIO_DOWNLOAD_FAILED
+
+
 async def download_audio(
     source_url: str, quality: int, dest: str, settings: Settings | None = None
 ) -> tuple[str | None, str | None]:
@@ -159,13 +228,12 @@ async def download_audio(
     problem, not a problem with the track.
     """
 
-    def _work() -> tuple[str | None, str | None]:
+    def _attempt(clients: list[str]) -> tuple[str | None, str | None]:
         YoutubeDL = _require_ytdlp()
-        outtmpl = str(Path(dest) / "%(id)s.%(ext)s")
         opts = _base_opts(settings)
         opts["format"] = "bestaudio/best"
-        opts["outtmpl"] = outtmpl
-        opts["extractor_args"] = {"youtube": {"player_client": ["android", "web", "android_vr", "tv_embedded"]}}
+        opts["outtmpl"] = str(Path(dest) / "%(id)s.%(ext)s")
+        opts["extractor_args"] = {"youtube": {"player_client": clients}}
         opts["postprocessors"] = [
             {
                 "key": "FFmpegExtractAudio",
@@ -178,16 +246,8 @@ async def download_audio(
                 info = ydl.extract_info(source_url, download=True)
         except Exception as e:
             msg = str(e)
-            if _is_bot_check(msg):
-                log.warning(f"[DL_AUDIO] AUDIO_BOT_CHECK Error: {msg[:200]}")
-                return None, AUDIO_BOT_CHECK
-            # ffprobe/ffmpeg missing or a broken postprocessor is an image
-            # problem that will fail every conversion, not this track.
-            if "ffmpeg" in msg.lower() or "ffprobe" in msg.lower() or "Postprocessing" in msg:
-                log.warning(f"[DL_AUDIO] AUDIO_FFMPEG_FAILED Error: {msg[:200]}")
-                return None, AUDIO_FFMPEG_FAILED
-            log.warning(f"[DL_AUDIO] AUDIO_DOWNLOAD_FAILED Error: {msg[:200]}")
-            return None, AUDIO_DOWNLOAD_FAILED
+            log.warning(f"[DL_AUDIO] client={clients} error: {msg[:180]}")
+            return None, _classify_download_error(msg)
         if not info:
             return None, AUDIO_DOWNLOAD_FAILED
         vid = info.get("id")
@@ -197,6 +257,23 @@ async def download_audio(
         if not candidate.exists():
             return None, AUDIO_NO_OUTPUT
         return str(candidate), None
+
+    def _work() -> tuple[str | None, str | None]:
+        # A 403 here is the transient server-IP throttle, not a property of
+        # the track: the next player client usually clears it. Only bother to
+        # retry on that and on an outright download failure; a missing
+        # converter or a bad postprocessor fails identically on every client.
+        last: tuple[str | None, str | None] = (None, AUDIO_DOWNLOAD_FAILED)
+        for i, client in enumerate(YT_PLAYER_CLIENTS):
+            path, err = _attempt([client])
+            if path:
+                if i:
+                    log.info(f"[DL_AUDIO] recovered on client={client!r} (attempt {i + 1})")
+                return path, None
+            last = (None, err)
+            if err not in (AUDIO_DOWNLOAD_FAILED, AUDIO_BOT_CHECK):
+                return last
+        return last
 
     async with _semaphore():
         return await asyncio.to_thread(_work)
@@ -275,9 +352,7 @@ async def download_youtube_video(
         YoutubeDL = _require_ytdlp()
         outtmpl = str(Path(dest) / "%(id)s.%(ext)s")
         opts = _base_opts(settings)
-        opts["extractor_args"] = {
-            "youtube": {"player_client": ["android", "web", "android_vr", "tv_embedded"]}
-        }
+        opts["extractor_args"] = {"youtube": {"player_client": YT_PLAYER_CLIENTS}}
         opts["format"] = (
             f"bestvideo[height={height}][ext=mp4]+bestaudio[ext=m4a]/"
             f"bestvideo[height={height}]+bestaudio/"

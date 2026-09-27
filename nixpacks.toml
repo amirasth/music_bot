@@ -1,5 +1,8 @@
 [phases.setup]
-aptPkgs = ["ffmpeg"]
+# nodejs is yt-dlp's JavaScript runtime for YouTube's signature/n-parameter
+# challenges — without it yt-dlp extracts a degraded format that 403s and the
+# download fails (codes 1001/2001).
+aptPkgs = ["ffmpeg", "nodejs"]
 nixPkgs = ["python311", "python311Packages.pip"]
 
 [phases.install]
