@@ -40,6 +40,7 @@ from .downloader import (
     download_audio_from_stream,
     download_direct_file,
     probe_url,
+    soundcloud_direct_url,
 )
 from .http import get_session
 from .keyboards import (
@@ -98,6 +99,19 @@ async def _progress_task(bot: Bot, chat_id: int, msg_id: int, prefix: str) -> No
             )
         except Exception:
             break
+
+def _search_hint(title: str, artist: str) -> str:
+    """Suffix naming the track so the user can search for it themselves.
+
+    Shazam may identify a song perfectly while every download source fails;
+    without this the user only sees an error and has nothing to type.
+    """
+    t = (title or "").strip()
+    if not t:
+        return ""
+    a = (artist or "").strip()
+    return f"\n\n🎶 {t}" + (f" — {a}" if a else "") + "\n🔍 اسم آهنگ رو جستجو کن"
+
 
 # Pending Instagram URL mapping: short_id -> (url, chat_id, user_id)
 instagram_pending = PendingStore()
@@ -296,7 +310,9 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
         if not match:
             log.info(f"[IG_MUSIC] NO_SOURCE_MATCH no match for {title[:40]!r}")
             await c.message.edit_text(
-                "😢 این موزیک در هیچ منبعی پیدا نشد." + code_line(NO_SOURCE_MATCH),
+                "😢 این موزیک در هیچ منبعی پیدا نشد."
+                + code_line(NO_SOURCE_MATCH)
+                + _search_hint(title, artist),
                 reply_markup=kb_back(),
             )
             return
@@ -906,7 +922,9 @@ async def process_soundcloud(m: Message, bot: Bot, url: str, settings: Settings,
     if not match:
         log.info(f"[SC] NO_SOURCE_MATCH no match for {sc['title'][:40]!r}")
         await status.edit_text(
-            "😢 این موزیک در هیچ منبعی پیدا نشد." + code_line(NO_SOURCE_MATCH),
+            "😢 این موزیک در هیچ منبعی پیدا نشد."
+            + code_line(NO_SOURCE_MATCH)
+            + _search_hint(sc.get("title") or "", sc.get("artist") or ""),
             reply_markup=kb_back(),
         )
         return
@@ -952,7 +970,9 @@ async def process_identify(m: Message, bot: Bot, url: str, settings: Settings, d
     if not match:
         log.info(f"[IDENTIFY] NO_SOURCE_MATCH no match for {title[:40]!r}")
         await status.edit_text(
-            "😢 این موزیک در هیچ منبعی پیدا نشد." + code_line(NO_SOURCE_MATCH),
+            "😢 این موزیک در هیچ منبعی پیدا نشد."
+            + code_line(NO_SOURCE_MATCH)
+            + _search_hint(title, artist),
             reply_markup=kb_back(),
         )
         return
@@ -1122,7 +1142,10 @@ async def _run_audio_download(
             f"uid={c.from_user.id if c.from_user else 0}"
         )
         await c.message.edit_text(
-            "❌ خطا در دانلود/ارسال." + code_line(code), reply_markup=kb_back()
+            "❌ خطا در دانلود/ارسال."
+            + code_line(code)
+            + _search_hint(job.get("title") or "", job.get("artist") or ""),
+            reply_markup=kb_back(),
         )
 
 
@@ -1171,6 +1194,15 @@ async def _download_and_send(
         path = await download_direct_file(source_url, str(root))
         if not path:
             err = AUDIO_STREAM_FAILED
+    elif "soundcloud.com" in source_url:
+        # SoundCloud's media endpoint bot-checks a server IP after a handful
+        # of downloads (the 2001/2008 failure). The progressive CDN URL from
+        # the same probe goes to plain aiohttp, which it does not gate.
+        direct = await soundcloud_direct_url(source_url)
+        if direct:
+            path = await download_audio_from_stream(direct, str(root))
+        if not path:
+            path, err = await download_audio(source_url, quality, str(root), settings)
     else:
         # yt-dlp download
         path, err = await download_audio(source_url, quality, str(root), settings)

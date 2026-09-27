@@ -20,6 +20,8 @@ AUDIO_TOO_LARGE = "2004"
 AUDIO_TOO_LONG = "2005"
 AUDIO_SEND_FAILED = "2006"
 AUDIO_FFMPEG_FAILED = "2007"
+# The source asked the server IP to prove it is not a bot (rate limit).
+AUDIO_BOT_CHECK = "2008"
 
 # Video / clip download.
 VIDEO_DOWNLOAD_FAILED = "3001"
@@ -30,6 +32,7 @@ DAILY_QUOTA_REACHED = "3005"
 CLIP_TOO_LARGE = "3006"
 CLIP_DOWNLOAD_FAILED = "3007"
 VIDEO_TOO_LONG = "3008"
+VIDEO_BOT_CHECK = "3009"
 
 # Search / identify.
 NO_SOURCE_MATCH = "4001"
@@ -128,6 +131,16 @@ _EXPLANATIONS: dict[str, str] = {
         "لینک پشتیبانی نمیشه یا نامعتبره.\n"
         "سایت‌های پشتیبانی‌شده: یوتیوب، اینستاگرام، تیک‌تاک، اسپاتیفای، ساندکلاد، ایکس."
     ),
+    AUDIO_BOT_CHECK: (
+        "منبع درخواست تأیید کرده که ربات نیستید (محدودیت IP سرور).\n"
+        "راه‌حل: فایل کوکی مرورگر رو در cookies.txt بذار و COOKIES_FILE رو تنظیم کن، "
+        "یا از YT_PROXY استفاده کن، یا چند دقیقه صبر کن."
+    ),
+    VIDEO_BOT_CHECK: (
+        "یوتیوب درخواست تأیید کرده که ربات نیستید (محدودیت IP سرور).\n"
+        "راه‌حل: فایل کوکی مرورگر رو در cookies.txt بذار و COOKIES_FILE رو تنظیم کن، "
+        "یا از YT_PROXY استفاده کن."
+    ),
     PENDING_EXPIRED: (
         "دکمه منقضی شده (بیشتر از ۱۵ دقیقه گذشته).\n"
         "برای حل: کاربر باید لینک رو دوباره بفرسته."
@@ -136,8 +149,13 @@ _EXPLANATIONS: dict[str, str] = {
 
 
 def code_line(code: str) -> str:
-    """The user-visible code footer, e.g. 'کد خطا: 2001'."""
-    return f"\n🔢 کد خطا: <code>{code}</code>"
+    """The user-visible code footer, e.g. 'کد خطا: 2001'.
+
+    Plain text on purpose: these messages are sent without parse_mode, and the
+    ones that embed exception text may contain characters that would break HTML
+    parsing if markup were used here.
+    """
+    return f"\n🔢 کد خطا: {code}"
 
 
 def explain(code: str) -> str | None:

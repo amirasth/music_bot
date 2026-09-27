@@ -8,9 +8,11 @@ from typing import Any
 
 from .config import Settings
 from .errors import (
+    AUDIO_BOT_CHECK,
     AUDIO_DOWNLOAD_FAILED,
     AUDIO_FFMPEG_FAILED,
     AUDIO_NO_OUTPUT,
+    VIDEO_BOT_CHECK,
     VIDEO_DOWNLOAD_FAILED,
     VIDEO_NO_OUTPUT,
 )
@@ -103,6 +105,50 @@ async def probe_url(url: str, settings: Settings | None = None) -> dict[str, Any
     return await asyncio.to_thread(_work)
 
 
+def _is_bot_check(msg: str) -> bool:
+    """True when the source is asking the server IP to prove it is not a bot."""
+    m = msg.lower()
+    return any(
+        p in m
+        for p in ("sign in to confirm", "not a bot", "bot check", "too many requests", "429")
+    )
+
+
+async def soundcloud_direct_url(source_url: str) -> str | None:
+    """Resolve a SoundCloud track to a progressive CDN URL.
+
+    SoundCloud's media endpoint bot-checks server IPs after a handful of
+    downloads, while its CDN serves the same bytes over plain HTTPS — so the
+    download goes through aiohttp instead of yt-dlp.
+    """
+
+    def _work() -> str | None:
+        YoutubeDL = _require_ytdlp()
+        opts = _base_opts(None)
+        opts["skip_download"] = True
+        try:
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(source_url, download=False)
+        except Exception as e:
+            log.info(f"[SC] direct resolve failed: {str(e)[:160]}")
+            return None
+        prog = [
+            f
+            for f in (info or {}).get("formats") or []
+            if f.get("url")
+            and f.get("protocol") in ("https", "http")
+            and f.get("vcodec") in (None, "none")
+        ]
+        if not prog:
+            return None
+        prog.sort(key=lambda f: 1 if f.get("ext") == "mp3" else 0, reverse=True)
+        url = prog[0].get("url")
+        log.info(f"[SC] direct URL resolved: {str(url)[:80]}")
+        return url
+
+    return await asyncio.to_thread(_work)
+
+
 async def download_audio(
     source_url: str, quality: int, dest: str, settings: Settings | None = None
 ) -> tuple[str | None, str | None]:
@@ -132,6 +178,9 @@ async def download_audio(
                 info = ydl.extract_info(source_url, download=True)
         except Exception as e:
             msg = str(e)
+            if _is_bot_check(msg):
+                log.warning(f"[DL_AUDIO] AUDIO_BOT_CHECK Error: {msg[:200]}")
+                return None, AUDIO_BOT_CHECK
             # ffprobe/ffmpeg missing or a broken postprocessor is an image
             # problem that will fail every conversion, not this track.
             if "ffmpeg" in msg.lower() or "ffprobe" in msg.lower() or "Postprocessing" in msg:
@@ -241,7 +290,11 @@ async def download_youtube_video(
             with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(source_url, download=True)
         except Exception as e:
-            log.warning(f"[DL_VIDEO] VIDEO_DOWNLOAD_FAILED Error: {e}")
+            msg = str(e)
+            if _is_bot_check(msg):
+                log.warning(f"[DL_VIDEO] VIDEO_BOT_CHECK Error: {msg[:200]}")
+                return None, VIDEO_BOT_CHECK
+            log.warning(f"[DL_VIDEO] VIDEO_DOWNLOAD_FAILED Error: {msg[:200]}")
             return None, VIDEO_DOWNLOAD_FAILED
         if not info:
             return None, VIDEO_DOWNLOAD_FAILED
