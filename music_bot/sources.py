@@ -1,6 +1,7 @@
 """Music source search — Avaland, Audius, SoundCloud, Piped, YouTube, Archive.org."""
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -48,8 +49,10 @@ try:
 except Exception:
     AVALAND_AVAILABLE = False
 
-_SPOTIFY_TRACK_RE = re.compile(
-    r"open\.spotify\.com/(?:intl-[a-z]{2}/)?track/([A-Za-z0-9]+)", flags=re.IGNORECASE
+_SPOTIFY_RE = re.compile(
+    r"open\.spotify\.com/(?:intl-[a-z]{2}/)?"
+    r"(track|album|playlist|artist|episode|show)/([A-Za-z0-9]+)",
+    flags=re.IGNORECASE,
 )
 
 # ── Piped instances ──
@@ -168,47 +171,139 @@ def is_supported_url(url: str) -> bool:
 # ═══════════════════════════════════════════════════
 
 
-async def fetch_spotify_meta(url: str) -> dict[str, str] | None:
-    """Get track title/artist from Spotify's public embed page (no auth needed)."""
-    m = _SPOTIFY_TRACK_RE.search(url)
+def _json_block(text: str, key: str) -> Any:
+    """Parse the JSON value that follows `key` in an HTML page.
+
+    The embed pages embed their payload as inline JSON, not in a <script> tag
+    with a stable id, so the value has to be located and brace-matched rather
+    than deserialised wholesale.
+    """
+    i = text.find(key)
+    if i < 0:
+        return None
+    start = i + len(key)
+    while start < len(text) and text[start] in " \t\n\r":
+        start += 1
+    if start >= len(text) or text[start] not in "{[":
+        return None
+    opener = text[start]
+    closer = "}" if opener == "{" else "]"
+    depth = 0
+    in_str = esc = False
+    for j in range(start, len(text)):
+        c = text[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start : j + 1])
+                except Exception:
+                    return None
+    return None
+
+
+async def spotify_meta(url: str) -> dict[str, Any] | None:
+    """Read a Spotify link's metadata from its public embed page (no auth).
+
+    Spotify streams are DRM-protected and cannot be downloaded, so this only
+    recovers what is needed to find the song on a source that can be: title,
+    artist, duration, the 30s preview, and — for albums, playlists and artists
+    — the track list, so the user can pick one song instead of the whole page
+    being ignored.
+    """
+    m = _SPOTIFY_RE.search(url)
     if not m:
         return None
-    embed_url = f"https://open.spotify.com/embed/track/{m.group(1)}"
+    kind, spotify_id = m.group(1).lower(), m.group(2)
+    # intl-xx URLs still resolve through the same embed path.
+    embed_url = f"https://open.spotify.com/embed/{kind}/{spotify_id}"
     try:
         async with get_session().get(embed_url) as resp:
             if resp.status != 200:
+                log.info(f"[SPOTIFY] embed HTTP {resp.status} for {kind}/{spotify_id}")
                 return None
             html = await resp.text()
-    except Exception:
+    except Exception as e:
+        log.info(f"[SPOTIFY] embed failed: {e}")
         return None
 
-    title = re.search(r'"title":"([^"]+)"', html)
-    artist = re.search(r'"artistName":"([^"]+)"', html)
-    if not title:
+    entity = _json_block(html, '"entity":')
+    if not isinstance(entity, dict):
+        # Region-blocked episodes and some show pages ship no entity payload.
+        log.info(f"[SPOTIFY] no entity for {kind}/{spotify_id}")
+        return None
+
+    tracks: list[dict[str, Any]] = []
+    if kind == "track":
+        artists = [a.get("name") for a in entity.get("artists") or [] if a.get("name")]
+        preview = (entity.get("audioPreview") or {}).get("url")
+        tracks.append(
+            {
+                "title": entity.get("title") or entity.get("name") or "",
+                "artist": ", ".join(artists),
+                "duration": int((entity.get("duration") or 0) / 1000),
+                "preview_url": _https_url(preview),
+            }
+        )
+    else:
+        for item in entity.get("trackList") or []:
+            if not item.get("title"):
+                continue
+            tracks.append(
+                {
+                    "title": item.get("title") or "",
+                    "artist": item.get("subtitle") or "",
+                    "duration": int((item.get("duration") or 0) / 1000),
+                    "preview_url": _https_url(
+                        (item.get("audioPreview") or {}).get("url")
+                    ),
+                }
+            )
+
+    if not tracks:
         return None
     return {
-        "title": title.group(1),
-        "artist": artist.group(1) if artist else "",
+        "kind": kind,
+        "id": spotify_id,
+        "title": entity.get("title") or entity.get("name") or "",
+        "artist": entity.get("subtitle") or "",
+        "tracks": tracks,
     }
 
 
+def _https_url(u: str | None) -> str:
+    if not u:
+        return ""
+    return u.replace("\\u002F", "/")
+
+
+async def fetch_spotify_meta(url: str) -> dict[str, str] | None:
+    """Title/artist of a single Spotify track (kept for the identify path)."""
+    meta = await spotify_meta(url)
+    if not meta or not meta["tracks"]:
+        return None
+    first = meta["tracks"][0]
+    return {"title": first["title"], "artist": first["artist"]}
+
+
 async def spotify_preview_url(url: str) -> str | None:
-    """Extract the 30s preview MP3 URL from Spotify's embed page."""
-    m = _SPOTIFY_TRACK_RE.search(url)
-    if not m:
+    """30s preview MP3 of a single Spotify track, for Shazam."""
+    meta = await spotify_meta(url)
+    if not meta or not meta["tracks"]:
         return None
-    embed_url = f"https://open.spotify.com/embed/track/{m.group(1)}"
-    try:
-        async with get_session().get(embed_url) as resp:
-            if resp.status != 200:
-                return None
-            html = await resp.text()
-    except Exception:
-        return None
-    match = re.search(r'"audioPreview":\s*\{"url":"([^"]+)"', html)
-    if match:
-        return match.group(1).replace("\\u002F", "/")
-    return None
+    return meta["tracks"][0].get("preview_url") or None
 
 
 # ═══════════════════════════════════════════════════
@@ -550,25 +645,21 @@ async def search_youtube(query: str, limit: int = 5, settings: Settings | None =
             from yt_dlp import YoutubeDL  # type: ignore
         except Exception:
             return []
-        opts: dict[str, Any] = {
-            "quiet": True,
-            "noprogress": True,
-            "no_warnings": True,
-            "skip_download": True,
-            # Flat entries skip the per-video page fetches that trigger the
-            # bot check from datacenter IPs — five results in ~2.4s instead
-            # of a 12s search that ends in a "confirm you're not a bot" wall.
-            "extract_flat": "in_playlist",
-            "ignoreerrors": True,
-        }
-        from .downloader import YT_PLAYER_CLIENTS, _js_runtime_opts
+        from .downloader import YT_PLAYER_CLIENTS, base_opts, set_youtube_clients
 
-        opts["extractor_args"] = {"youtube": {"player_client": YT_PLAYER_CLIENTS}}
-        opts.update(_js_runtime_opts())
-        if settings and settings.cookies_file:
-            opts["cookiefile"] = settings.cookies_file
-        if settings and settings.yt_proxy:
-            opts["proxy"] = settings.yt_proxy
+        # base_opts carries cookies, proxy, JS runtime and PO-token args;
+        # assigning extractor_args here would throw the PO-token entry away.
+        opts = set_youtube_clients(base_opts(settings), YT_PLAYER_CLIENTS)
+        opts.update(
+            {
+                "skip_download": True,
+                # Flat entries skip the per-video page fetches that trigger
+                # the bot check from datacenter IPs — five results in ~2.4s
+                # instead of a 12s search ending in "confirm you're not a bot".
+                "extract_flat": "in_playlist",
+                "ignoreerrors": True,
+            }
+        )
         try:
             with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)

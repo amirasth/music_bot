@@ -1,9 +1,8 @@
 [phases.setup]
 # nodejs is yt-dlp's JavaScript runtime for YouTube's signature/n-parameter
-# challenges — without it yt-dlp extracts a degraded format that 403s and the
-# download fails (codes 1001/2001).
-aptPkgs = ["ffmpeg", "nodejs"]
-nixPkgs = ["python311", "python311Packages.pip"]
+# challenges. yt-dlp requires Node >= 22; Debian/nixpacks' default is older.
+aptPkgs = ["ffmpeg"]
+nixPkgs = ["python311", "python311Packages.pip", "nodejs_22"]
 
 [phases.install]
 cmds = ["pip install -r requirements.txt"]

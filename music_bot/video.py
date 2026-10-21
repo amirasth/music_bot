@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 
 from aiogram import Bot
-from aiogram.types import CallbackQuery, FSInputFile, Message
+from aiogram.types import CallbackQuery, FSInputFile, LinkPreviewOptions, Message
 
 from .config import Settings
 from .downloader import download_youtube_video, probe_url
@@ -462,8 +462,15 @@ async def process_tweet(m: Message, bot: Bot, url: str, db=None, settings=None) 
                     await status.delete()
                 return
 
-        # Nothing sendable — post the text on its own.
-        await status.edit_text(caption[:4096], parse_mode="HTML", reply_markup=kb_back())
+        # Nothing sendable — post the text on its own. The author's name is a
+        # link to the post, but the preview card is suppressed: the card shows
+        # a duplicate of the post and, for a link-only post, nothing else.
+        await status.edit_text(
+            caption[:4096],
+            parse_mode="HTML",
+            reply_markup=kb_back(),
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
     except Exception as e:
         log.warning(f"[X] processing failed: {e}")
         await _report(m, status, f"❌ خطا در ارسال: {e}")

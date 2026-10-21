@@ -36,6 +36,7 @@ from .errors import (
     explain,
 )
 from .downloader import (
+    base_opts,
     download_audio,
     download_audio_from_stream,
     download_direct_file,
@@ -51,6 +52,7 @@ from .keyboards import (
     kb_instagram_choice,
     kb_main,
     kb_quality,
+    kb_spotify_tracks,
 )
 from .shazam import identify_with_multi_segment
 from .sources import (
@@ -63,6 +65,7 @@ from .sources import (
     is_twitter,
     is_youtube,
     soundcloud_meta,
+    spotify_meta,
     spotify_preview_url,
 )
 from .state import (
@@ -118,6 +121,9 @@ instagram_pending = PendingStore()
 
 # Instagram clips awaiting a quality choice: token -> url
 ig_clip_pending = PendingStore()
+
+# Spotify track lists awaiting a pick: token -> {kind, title, artist, tracks:[...]}
+spotify_pending = PendingStore()
 
 # Track last quality used per job for retry toggle
 last_quality_by_job: dict[int, int] = {}
@@ -410,14 +416,13 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             except Exception:
                 return None
             outtmpl = str(root / "video.%(ext)s")
-            opts = {
-                "format": fmt,
-                "outtmpl": outtmpl,
-                "merge_output_format": "mp4",
-                "quiet": True,
-                "noprogress": True,
-                "no_warnings": True,
-            }
+            # Instagram gates anonymous reads behind a rate-limit wall; yt-dlp
+            # only gets past it with browser impersonation, which the shared
+            # opts enable (curl_cffi), plus cookies when configured.
+            opts = base_opts(settings)
+            opts["format"] = fmt
+            opts["outtmpl"] = outtmpl
+            opts["merge_output_format"] = "mp4"
             try:
                 with YoutubeDL(opts) as ydl:
                     ydl.download([original_url])
@@ -545,6 +550,52 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
                 estimate_size_mb(duration, 128),
                 estimate_size_mb(duration, 320),
             ),
+        )
+
+    # ── Spotify track-list pick ──
+
+    @router.callback_query(lambda c: c.data.startswith("spt:"))
+    async def cb_spotify_pick(c: CallbackQuery, bot: Bot):
+        try:
+            _, token, idx_s = c.data.split(":")
+            idx = int(idx_s)
+        except ValueError:
+            await c.answer("درخواست نامعتبر.", show_alert=True)
+            return
+        entry = spotify_pending.take(token, user_id=c.from_user.id)
+        if entry is None:
+            log.info(f"[CB] PENDING_EXPIRED uid={c.from_user.id if c.from_user else 0}")
+            await c.answer("منقضی شد یا لینک نامعتبر است.", show_alert=True)
+            return
+        payload = entry.value
+        tracks = payload.get("tracks") or []
+        if not 0 <= idx < len(tracks):
+            await c.answer("درخواست نامعتبر.", show_alert=True)
+            return
+        t = tracks[idx]
+        await c.answer()
+        status = await c.message.edit_text(
+            f"🔎 در حال جستجوی «{t['title']}»...", reply_markup=kb_back()
+        )
+        match = await find_best_match(t["title"], t.get("artist", ""), settings)
+        if not match:
+            log.info(f"[SPOTIFY] NO_SOURCE_MATCH no match for {t['title'][:40]!r}")
+            await status.edit_text(
+                "😢 این موزیک در هیچ منبعی پیدا نشد."
+                + code_line(NO_SOURCE_MATCH)
+                + _search_hint(t["title"], t.get("artist", "")),
+                reply_markup=kb_back(),
+            )
+            return
+        await _offer_match(
+            c.message,
+            status,
+            match,
+            title=t["title"],
+            artist=t.get("artist", ""),
+            method_note="🎵 پیدا شده از منابع دیگر (لینک اسپاتیفای)",
+            settings=settings,
+            db=db,
         )
 
     # ── Download audio callback ──
@@ -693,9 +744,15 @@ def setup_handlers(router: Router, db: DB, settings: Settings) -> None:
             await process_soundcloud(m, bot, url, settings, db)
             return
 
-        # TikTok, Spotify: identify music (Shazam)
-        if is_tiktok(url) or is_spotify(url):
+        # TikTok: identify music (Shazam)
+        if is_tiktok(url):
             await process_identify(m, bot, url, settings, db)
+            return
+
+        # Spotify: read the embed page (no auth needed); single track → match
+        # directly, album/playlist/artist → show a track list to pick from.
+        if is_spotify(url):
+            await process_spotify(m, bot, url, settings, db)
             return
 
         # Twitter/X
@@ -937,6 +994,64 @@ async def process_soundcloud(m: Message, bot: Bot, url: str, settings: Settings,
         method_note="🔗 پیدا شده از منابع دیگر (لینک DRM)",
         settings=settings,
         db=db,
+    )
+
+
+async def process_spotify(m: Message, bot: Bot, url: str, settings: Settings, db: DB) -> None:
+    """Spotify link: a single track is matched directly; a list asks which one.
+
+    Spotify streams are DRM-protected, so nothing is ever downloaded from Spotify
+    itself — the embed page (no auth needed) is read for the title/artist, and
+    the song is then found on a source that can actually be downloaded.
+    """
+    status = await _reply(m, "🎵 در حال خواندن لینک اسپاتیفای...", reply_markup=kb_back())
+    meta = await spotify_meta(url)
+    if not meta:
+        log.info(f"[SPOTIFY] METADATA_UNREADABLE failed for {url[:80]}")
+        await status.edit_text(
+            "😢 نتونستم این لینک اسپاتیفای رو باز کنم.\n"
+            "لینک رو دوباره کپی کن یا از لینک مستقیم یوتیوب استفاده کن."
+            + code_line(METADATA_UNREADABLE),
+            reply_markup=kb_back(),
+        )
+        return
+
+    tracks = meta["tracks"]
+    # A single track is unambiguous: match and offer it right away, skipping
+    # the picker entirely.
+    if meta["kind"] == "track" and len(tracks) == 1:
+        t = tracks[0]
+        match = await find_best_match(t["title"], t.get("artist", ""), settings)
+        if not match:
+            await status.edit_text(
+                "😢 این موزیک در هیچ منبعی پیدا نشد."
+                + code_line(NO_SOURCE_MATCH)
+                + _search_hint(t["title"], t.get("artist", "")),
+                reply_markup=kb_back(),
+            )
+            return
+        await _offer_match(
+            m, status, match,
+            title=t["title"], artist=t.get("artist", ""),
+            method_note="🎵 پیدا شده از منابع دیگر (لینک اسپاتیفای)",
+            settings=settings, db=db,
+        )
+        return
+
+    # Album / playlist / artist: show the track list so the user picks one.
+    token = uuid.uuid4().hex[:8]
+    spotify_pending.put(
+        token,
+        {"kind": meta["kind"], "title": meta["title"], "artist": meta["artist"], "tracks": tracks},
+        user_id=m.from_user.id if m.from_user else 0,
+        chat_id=m.chat.id,
+    )
+    kind_label = {"album": "آلبوم", "playlist": "پلی‌لیست", "artist": "آرتیست"}.get(meta["kind"], "لیست")
+    await status.edit_text(
+        f"🎵 {kind_label}: {meta['title']}\n"
+        f"👤 {meta.get('artist') or 'نامشخص'}\n"
+        f"🎶 یکی از {len(tracks)} آهنگ رو انتخاب کن:",
+        reply_markup=kb_spotify_tracks(token, tracks),
     )
 
 

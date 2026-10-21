@@ -4,12 +4,13 @@
 
 ## قابلیت‌ها
 
-- **شناسایی موزیک**: از لینک‌های Spotify، Instagram، TikTok، SoundCloud
+- **شناسایی موزیک**: از لینک‌های Instagram، TikTok، SoundCloud (با Shazam)
+- **Spotify**: تک‌آهنگ، آلبوم، پلی‌لیست و آرتیست — آلبوم/پلی‌لیست به فهرست آهنگ تبدیل می‌شود و خودت یکی را انتخاب می‌کنی
 - **دانلود صوت**: کیفیت 128 یا 320 kbps با ID3 tag
 - **دانلود ویدیو**: YouTube با کیفیت 360p/480p/720p (حداکثر ۵۰MB)
-- **کلیپ اینستاگرام و ایکس**: انتخاب بین کم‌حجم (۴۸۰p) و کیفیت اصلی
+- **کلیپ اینستاگرام و ایکس**: انتخاب بین کیفیت معمولی و بالاتر
 - **جستجو**: نام آهنگ با نمایش 6 نتیجه
-- **پشتیبانی از Twitter/X**: نمایش متن و مدیا پست
+- **پشتیبانی از Twitter/X**: نمایش متن و مدیا پست — اسم نویسنده لینک پست است، پیش‌نمایش لینک نمایش داده نمی‌شود
 - **منابع متعدد**: Avaland (فارسی)، Audius، SoundCloud، Piped، YouTube، Archive.org
 - **ادمین**: دکمه «📊 آمار ربات» در منوی اصلی، به‌همراه `/info` و `/jobs`
 
@@ -48,6 +49,7 @@
 | `YTDL_CONCURRENCY` | `4` | دانلود همزمان yt-dlp |
 | `COOKIES_FILE` | — | مسیر فایل کوکی برای یوتیوب |
 | `YT_PROXY` | — | پراکسی برای یوتیوب |
+| `POT_BASE_URL` | — | آدرس سرور PO Token برای دورزدن «confirm you're not a bot» |
 
 ### قدم ۴: ساخت Volume
 
@@ -124,17 +126,30 @@ music_bot/
 
 ### YouTube blocked from datacenter IPs
 
-اگر YouTube از IP سرور بلاک شده:
+اگر YouTube از IP سرور بلاک شده (خطای «Sign in to confirm you're not a bot»):
 
 1. فایل کوکی مرورگر خود را دانلود کنید (فرمت Netscape)
 2. فایل را به نام `cookies.txt` در روت پروژه قرار دهید
 3. متغیر `COOKIES_FILE=/app/cookies.txt` را تنظیم کنید
+
+اگر کوکی جواب نداد، یک سرور PO Token بالا ببرید و متغیر `POT_BASE_URL` را به آن اشاره دهید:
+
+```bash
+docker run --name pot-provider -d -p 127.0.0.1:4416:4416 \
+  brainicism/bgutil-ytdlp-pot-provider
+```
+
+```env
+POT_BASE_URL=http://pot-provider:4416
+```
 
 یا از پراکسی استفاده کنید:
 
 ```env
 YT_PROXY=socks5://user:pass@host:1080
 ```
+
+> **نکته:** ایمیج دیگر به Node 22 نیاز دارد (یوتیوب بدون آن فرمتهای کامل را استخراج نمی‌کند). Dockerfile و nixpacks.toml هر دو این را نصب می‌کنند — دستی نسخه‌ی قدیمی‌تر نگذارید.
 
 ### File too big
 

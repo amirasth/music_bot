@@ -45,6 +45,9 @@ class Settings:
     ytdl_concurrency: int = 4
     cookies_file: str = ""
     yt_proxy: str = ""
+    # Base URL of a bgutil PO-token provider. Empty disables it; the plugin is
+    # installed but idle, so this is safe to leave unset.
+    pot_base_url: str = ""
     enable_avaland: bool = True
     enable_audius: bool = True
     enable_piped: bool = True
@@ -67,6 +70,7 @@ def load_settings() -> Settings:
         ytdl_concurrency=max(1, _int_env("YTDL_CONCURRENCY", 4)),
         cookies_file=os.getenv("COOKIES_FILE", "").strip(),
         yt_proxy=os.getenv("YT_PROXY", "").strip(),
+        pot_base_url=os.getenv("POT_BASE_URL", "").strip(),
         enable_avaland=_bool_env("ENABLE_AVALAND", True),
         enable_audius=_bool_env("ENABLE_AUDIUS", True),
         enable_piped=_bool_env("ENABLE_PIPED", True),

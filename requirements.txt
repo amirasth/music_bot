@@ -2,7 +2,11 @@ aiogram>=3.13.0,<4.0.0
 aiohttp>=3.9.0
 aiosqlite>=0.20.0
 python-dotenv>=1.0.0
-yt-dlp>=2024.8.6
+# [default] brings yt-dlp-ejs (needed for YouTube's JS challenges), [curl-cffi]
+# enables browser impersonation, which is what makes Instagram work at all.
+yt-dlp[default,curl-cffi]>=2025.5.22
+# PO Token plugin: only does anything when POT_BASE_URL points at a provider.
+bgutil-ytdlp-pot-provider>=2.0.0
 mutagen>=1.47.0
 shazamio>=0.6.0
 avaland>=0.1.0a0

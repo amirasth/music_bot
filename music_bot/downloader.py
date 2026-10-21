@@ -101,7 +101,19 @@ def _require_ytdlp():
     return YoutubeDL
 
 
-def _base_opts(settings: Settings | None = None) -> dict[str, Any]:
+def _pot_args(settings: Settings | None) -> dict[str, Any]:
+    """bgutil PO-token provider args, only when one is configured.
+
+    The plugin is installed unconditionally; without a reachable provider it
+    registers no tokens and stays out of the way, so an unset POT_BASE_URL is
+    the disabled state rather than a separate install path.
+    """
+    if settings and settings.pot_base_url:
+        return {"youtubepot-bgutilhttp": {"base_url": [settings.pot_base_url]}}
+    return {}
+
+
+def base_opts(settings: Settings | None = None) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
         "noprogress": True,
@@ -114,6 +126,9 @@ def _base_opts(settings: Settings | None = None) -> dict[str, Any]:
         "extractor_retries": 2,
     }
     opts.update(_js_runtime_opts())
+    args = _pot_args(settings)
+    if args:
+        opts["extractor_args"] = args
     if settings:
         if settings.cookies_file:
             opts["cookiefile"] = settings.cookies_file
@@ -122,14 +137,19 @@ def _base_opts(settings: Settings | None = None) -> dict[str, Any]:
     return opts
 
 
+def set_youtube_clients(opts: dict[str, Any], clients: list[str]) -> dict[str, Any]:
+    """Add the YouTube player clients without dropping other extractor args."""
+    opts.setdefault("extractor_args", {})["youtube"] = {"player_client": list(clients)}
+    return opts
+
+
 async def probe_url(url: str, settings: Settings | None = None) -> dict[str, Any] | None:
     """Get metadata for a URL without downloading."""
 
     def _work() -> dict[str, Any] | None:
         YoutubeDL = _require_ytdlp()
-        opts = _base_opts(settings)
+        opts = set_youtube_clients(base_opts(settings), YT_PLAYER_CLIENTS)
         opts["skip_download"] = True
-        opts["extractor_args"] = {"youtube": {"player_client": YT_PLAYER_CLIENTS}}
         try:
             with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -181,7 +201,7 @@ async def soundcloud_direct_url(source_url: str) -> str | None:
 
     def _work() -> str | None:
         YoutubeDL = _require_ytdlp()
-        opts = _base_opts(None)
+        opts = base_opts(None)
         opts["skip_download"] = True
         try:
             with YoutubeDL(opts) as ydl:
@@ -230,10 +250,9 @@ async def download_audio(
 
     def _attempt(clients: list[str]) -> tuple[str | None, str | None]:
         YoutubeDL = _require_ytdlp()
-        opts = _base_opts(settings)
+        opts = set_youtube_clients(base_opts(settings), clients)
         opts["format"] = "bestaudio/best"
         opts["outtmpl"] = str(Path(dest) / "%(id)s.%(ext)s")
-        opts["extractor_args"] = {"youtube": {"player_client": clients}}
         opts["postprocessors"] = [
             {
                 "key": "FFmpegExtractAudio",
@@ -351,8 +370,7 @@ async def download_youtube_video(
     def _work() -> tuple[str | None, str | None]:
         YoutubeDL = _require_ytdlp()
         outtmpl = str(Path(dest) / "%(id)s.%(ext)s")
-        opts = _base_opts(settings)
-        opts["extractor_args"] = {"youtube": {"player_client": YT_PLAYER_CLIENTS}}
+        opts = set_youtube_clients(base_opts(settings), YT_PLAYER_CLIENTS)
         opts["format"] = (
             f"bestvideo[height={height}][ext=mp4]+bestaudio[ext=m4a]/"
             f"bestvideo[height={height}]+bestaudio/"
